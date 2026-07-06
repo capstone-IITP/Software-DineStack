@@ -1,0 +1,330 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/prisma-desktop-client"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model ActivationCode {
+  id           String      @id
+  code         String      @unique
+  status       String      @default("ACTIVE")
+  usedAt       DateTime?
+  expiresAt    DateTime
+  durationDays Int
+  entityName   String?
+  isUsed       Boolean     @default(false)
+  maxTables    Int
+  plan         String
+  createdAt    DateTime    @default(now())
+  restaurantId String?
+  Restaurant   Restaurant? @relation("RestaurantActivationCodes", fields: [restaurantId], references: [id], onDelete: Cascade)
+  activeForRestaurant Restaurant? @relation("CurrentActivationCode")
+  lastValidated DateTime?
+
+  @@index([restaurantId])
+}
+
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  action    String
+  user      String
+  target    String
+  details   String
+  timestamp DateTime @default(now())
+
+  @@index([timestamp])
+}
+
+model Category {
+  id           String     @id
+  name         String
+  isActive     Boolean    @default(true)
+  restaurantId String
+  createdAt    DateTime   @default(now())
+  code         String?
+  useRestaurantGST Boolean @default(true)
+  gstRate      Float?
+  Restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  MenuItem     MenuItem[]
+
+  @@index([restaurantId])
+}
+
+model Device {
+  id           String     @id
+  restaurantId String
+  createdAt    DateTime   @default(now())
+  deviceId     String
+  lastUsed     DateTime   @default(now())
+  role         String
+  lastSeen     DateTime?
+  status       String?
+  type         String?
+  Restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+
+  @@index([restaurantId])
+  @@index([deviceId])
+}
+
+model MenuItem {
+  id           String      @id
+  name         String
+  description  String?
+  price        Float
+  image        String?
+  isActive     Boolean     @default(true)
+  categoryId   String
+  restaurantId String
+  createdAt    DateTime    @default(now())
+  foodType     String      @default("Veg")
+  taxSource    String      @default("RESTAURANT")
+  gstRate      Float?
+  Category     Category    @relation(fields: [categoryId], references: [id])
+  Restaurant   Restaurant  @relation(fields: [restaurantId], references: [id])
+  OrderItem    OrderItem[]
+
+  @@index([restaurantId])
+  @@index([categoryId])
+}
+
+model Order {
+  id           String      @id
+  status       String      @default("RECEIVED")
+  totalAmount  Float       @default(0)
+  tableId      String
+  restaurantId String
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime
+  
+  // Tax fields
+  subtotal     Float       @default(0)
+  gstAmount    Float       @default(0)
+  grandTotal   Float       @default(0)
+  effectiveGstRate Float?
+  gstMode      String?
+
+  // Discount fields
+  couponCode     String?
+  discountAmount Float       @default(0)
+
+  Restaurant   Restaurant  @relation(fields: [restaurantId], references: [id])
+  Table        Table       @relation(fields: [tableId], references: [id])
+  OrderItem    OrderItem[]
+  customerId   String?
+  customer     Customer?   @relation(fields: [customerId], references: [id])
+  synced       Boolean     @default(false)
+
+  @@index([restaurantId])
+  @@index([tableId])
+  @@index([customerId])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id         String   @id
+  quantity   Int      @default(1)
+  notes      String?
+  orderId    String
+  menuItemId String
+  createdAt  DateTime @default(now())
+  MenuItem   MenuItem @relation(fields: [menuItemId], references: [id])
+  Order      Order    @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([menuItemId])
+}
+
+model Restaurant {
+  id                 String           @id
+  name               String
+  isActive           Boolean          @default(true)
+  createdAt          DateTime         @default(now())
+  ownerEmail         String?
+  activationCodeId   String?          @unique
+  adminPin           String?
+  kitchenPin         String?
+  revocationReason   String?
+  revokedAt          DateTime?
+  revokedBy          String?
+  subscriptionEndsAt DateTime?
+  status             String           @default("ACTIVE")
+  forceReactivation  Boolean?
+  isRegistered       Boolean?
+  address            String?
+  city               String?
+  email              String?
+  phone              String?
+  recoveryLockUntil  DateTime?
+  activationDate        DateTime?
+  trialEndDate          DateTime?
+  currentPlan           String?          @default("TRIAL")
+  planStatus            String           @default("TRIAL")
+  lastCloudVerification DateTime?
+  activationCode        String? // Preserved to prevent data loss
+  ownerId               String?
+  ownerName             String?
+  subscriptionId        String?
+  planType              String?          @default("TRIAL")
+  autopayEnabled        Boolean          @default(false)
+  nextBillingDate       DateTime?
+  
+  // GST & Tax Configuration
+  gstEnabled            Boolean          @default(false)
+  gstMode               String           @default("EXCLUSIVE")
+  gstNumber             String?
+  defaultGstRate        Float            @default(5.0)
+
+  Category           Category[]
+  Device             Device[]
+  MenuItem           MenuItem[]
+  Order              Order[]
+  ActivationCode     ActivationCode?  @relation("CurrentActivationCode", fields: [activationCodeId], references: [id])
+  activationCodes    ActivationCode[] @relation("RestaurantActivationCodes")
+  Session            Session[]
+  Table              Table[]
+  pairCodes          PairCode[]
+  RecoveryCode       RecoveryCode[]
+  tableSessions      TableSession[]
+  customers          Customer[]
+  refreshTokens      RefreshToken[]
+  coupons            Coupon[]
+}
+
+model Customer {
+  id           String     @id @default(uuid())
+  deviceToken  String
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  orders       Order[]
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([deviceToken, restaurantId])
+  @@index([restaurantId])
+}
+
+model Session {
+  id           String     @id
+  token        String     @unique
+  tableId      String
+  restaurantId String
+  expiresAt    DateTime
+  createdAt    DateTime   @default(now())
+  Restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  Table        Table      @relation(fields: [tableId], references: [id])
+
+  @@index([restaurantId])
+  @@index([tableId])
+}
+
+model SuperAdmin {
+  id        String   @id
+  email     String   @unique
+  password  String
+  createdAt DateTime @default(now())
+}
+
+model Table {
+  id           String     @id
+  label        String
+  capacity     Int        @default(4)
+  isActive     Boolean    @default(true)
+  restaurantId String
+  createdAt    DateTime   @default(now())
+  Order        Order[]
+  Session      Session[]
+  tableSessions TableSession[]
+  Restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+
+  @@index([restaurantId])
+}
+
+model PairCode {
+  id             String     @id @default(uuid())
+  code           String     @unique    // Format: DINE-XXXX
+  restaurantId   String
+  restaurant     Restaurant @relation(fields: [restaurantId], references: [id])
+  pairCodeActive Boolean    @default(true)
+  pairCodeUsed   Boolean    @default(false)
+  kitchenOnline  Boolean    @default(false)
+  failedAttempts Int        @default(0)
+  lockedUntil    DateTime?
+  createdAt      DateTime   @default(now())
+  expiresAt      DateTime   // Auto-expire after 10 minutes
+
+  @@index([restaurantId])
+}
+
+model RecoveryCode {
+  id           String     @id @default(uuid())
+  codeHash     String
+  used         Boolean    @default(false)
+  restaurantId String
+  Restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  createdAt    DateTime   @default(now())
+
+  @@index([restaurantId])
+}
+
+model TableSession {
+  id           String     @id @default(uuid())
+  tableId      String
+  table        Table      @relation(fields: [tableId], references: [id])
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  status       String     @default("ACTIVE") // ACTIVE, COMPLETED, CLOSED
+  isActive     Boolean    @default(true)
+  expiresAt    DateTime
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([restaurantId])
+  @@index([tableId])
+}
+
+model RefreshToken {
+  id           String     @id @default(uuid())
+  tokenHash    String     @unique
+  restaurantId String
+  deviceId     String
+  expiresAt    DateTime
+  createdAt    DateTime   @default(now())
+  Restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId])
+  @@index([deviceId])
+}
+
+model KitchenDeviceLink {
+  kitchenDeviceId            String   @id
+  restaurantId               String
+  cloudRestaurantId          String
+  deviceFingerprint          String?
+  linkedAt                   DateTime @default(now())
+  lastVerifiedAt             DateTime @default(now())
+  lastSuccessfulVerification DateTime @default(now())
+  status                     String   @default("LINKED") // LINKED | UNLINKED | REVOKED
+}
+
+model Coupon {
+  id            String    @id @default(uuid())
+  code          String
+  discountType  String
+  discountValue Float
+  expiresAt     DateTime?
+  minOrderValue Float?
+  maxDiscount   Float?
+  maxUsage      Int?
+  usageCount    Int       @default(0)
+  status        String    @default("ACTIVE")
+  restaurantId  String
+  restaurant    Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+
+  @@index([restaurantId])
+}

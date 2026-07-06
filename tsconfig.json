@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./dist",
+    "strict": false,
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@prisma/client": [
+        "./node_modules/@prisma/client"
+      ]
+    },
+    "typeRoots": [
+      "./node_modules/@types"
+    ]
+  },
+  "include": [
+    "server.ts",
+    "utils/**/*",
+    "middleware/**/*"
+  ]
+}
