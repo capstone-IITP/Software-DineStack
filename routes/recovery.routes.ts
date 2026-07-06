@@ -88,6 +88,36 @@ router.post('/generate', authenticate, authorize(['ADMIN']), async (req: express
     }
 });
 
+/**
+ * POST /api/recovery/verify-code
+ * Verifies a recovery code directly against the cloud database.
+ */
+router.post('/verify-code', async (req, res) => {
+    const { recoveryCode } = req.body;
+    if (!recoveryCode) return res.status(400).json({ error: 'Recovery code is required' });
+
+    try {
+        const unusedCodes = await prisma.recoveryCode.findMany({ where: { used: false } });
+        let matchedCode: any = null;
+        for (const code of unusedCodes) {
+            const isMatch = await bcrypt.compare(recoveryCode.toUpperCase().trim(), code.codeHash);
+            if (isMatch) {
+                matchedCode = code;
+                break;
+            }
+        }
+
+        if (!matchedCode) {
+            return res.status(401).json({ error: 'Invalid or used recovery code' });
+        }
+
+        return res.json({ success: true, message: 'Code valid', restaurantId: matchedCode.restaurantId });
+    } catch (error) {
+        console.error('Verify Recovery Code Error:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
 console.log("Recovery routes loaded");
 
 export default router;

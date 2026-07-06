@@ -2199,6 +2199,15 @@ app.get('/api/security/pin-audit-logs', authenticate, authorize(['ADMIN']), asyn
 // --- Module: Admin PIN Recovery System ---
 
 // POST /api/recovery/verify-code (Disaster Recovery Step 1)
+app.get('/api/debug-recovery', async (req, res) => {
+    let cloudCodes = [];
+    if (cloudPrisma) {
+        cloudCodes = await cloudPrisma.recoveryCode.findMany();
+    }
+    const localCodes = await prisma.recoveryCode.findMany();
+    res.json({ cloudCodes, localCodes });
+});
+
 app.post('/api/recovery/verify-code', async (req, res) => {
     const { recoveryCode } = req.body;
     if (!recoveryCode) return res.status(400).json({ error: 'Recovery code is required' });
@@ -2207,21 +2216,6 @@ app.post('/api/recovery/verify-code', async (req, res) => {
 
     try {
         let unusedCodes = await prisma.recoveryCode.findMany({ where: { used: false } });
-
-        if (cloudPrisma) {
-            try {
-                const cloudCodes = await cloudPrisma.recoveryCode.findMany({ where: { used: false } });
-                // Only add cloud codes that aren't already in the local array (by codeHash)
-                for (const cc of cloudCodes) {
-                    if (!unusedCodes.some(uc => uc.codeHash === cc.codeHash)) {
-                        unusedCodes.push(cc as any);
-                    }
-                }
-            } catch (e) {
-                console.warn('[Recovery] Could not fetch cloud codes:', e);
-            }
-        }
-
         let matchedCode: any = null;
         for (const code of unusedCodes) {
             const isMatch = await bcrypt.compare(recoveryCode.toUpperCase().trim(), code.codeHash);
@@ -2231,11 +2225,42 @@ app.post('/api/recovery/verify-code', async (req, res) => {
             }
         }
 
-        if (!matchedCode) {
-            return res.status(401).json({ error: 'Invalid or used recovery code' });
+        if (matchedCode) {
+            return res.json({ success: true, message: 'Code valid (local)', restaurantId: matchedCode.restaurantId });
         }
 
-        return res.json({ success: true, message: 'Code valid', restaurantId: matchedCode.restaurantId });
+        // If not found locally, check Cloud REST API (this is secure and avoids fetching all codes)
+        try {
+            const cloudResponse = await fetch(`${process.env.CLOUD_API_URL || 'https://software.dinestack.in/api'}/recovery/verify-code`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ recoveryCode: recoveryCode.toUpperCase().trim() })
+            });
+
+            if (cloudResponse.ok) {
+                const data = await cloudResponse.json();
+                return res.json({ success: true, message: 'Code valid (cloud)', restaurantId: data.restaurantId });
+            }
+        } catch (apiErr) {
+            console.warn('[Recovery] Cloud API verify failed:', apiErr);
+        }
+
+        // Fallback to cloudPrisma just in case (legacy)
+        if (cloudPrisma) {
+            try {
+                const cloudCodes = await cloudPrisma.recoveryCode.findMany({ where: { used: false } });
+                for (const cc of cloudCodes) {
+                    const isMatch = await bcrypt.compare(recoveryCode.toUpperCase().trim(), cc.codeHash);
+                    if (isMatch) {
+                        return res.json({ success: true, message: 'Code valid', restaurantId: cc.restaurantId });
+                    }
+                }
+            } catch (e) {
+                console.warn('[Recovery] Could not fetch cloud codes:', e);
+            }
+        }
+
+        return res.status(401).json({ error: 'Invalid or used recovery code' });
     } catch (e: any) {
         console.error('Verify code error:', e);
         return res.status(500).json({ error: 'Internal server error' });
@@ -2277,28 +2302,38 @@ app.post('/api/recovery/execute', async (req, res) => {
 
         // 2. Verify Recovery Code again
         let unusedCodes = await prisma.recoveryCode.findMany({ where: { used: false } });
-        if (cloudPrisma) {
+        let matchedCode: any = null;
+        let isLocalMatch = false;
+
+        for (const code of unusedCodes) {
+            const isMatch = await bcrypt.compare(recoveryCode.toUpperCase().trim(), code.codeHash);
+            if (isMatch) {
+                matchedCode = code;
+                isLocalMatch = true;
+                break;
+            }
+        }
+
+        if (!isLocalMatch && cloudPrisma) {
             try {
                 const cloudCodes = await cloudPrisma.recoveryCode.findMany({ where: { used: false } });
                 for (const cc of cloudCodes) {
-                    if (!unusedCodes.some(uc => uc.codeHash === cc.codeHash)) {
-                        unusedCodes.push(cc as any);
+                    const isMatch = await bcrypt.compare(recoveryCode.toUpperCase().trim(), cc.codeHash);
+                    if (isMatch) {
+                        matchedCode = cc;
+                        break;
                     }
                 }
             } catch (e) { }
         }
 
-        let matchedCode: any = null;
-        for (const code of unusedCodes) {
-            const isMatch = await bcrypt.compare(recoveryCode.toUpperCase().trim(), code.codeHash);
-            if (isMatch) {
-                matchedCode = code;
-                break;
-            }
-        }
-
         if (!matchedCode) {
-            return res.status(401).json({ error: 'Recovery code invalid or already used' });
+            return res.status(401).json({ error: 'Invalid or used recovery code' });
+        }
+        
+        // Mark code as used
+        if (isLocalMatch) {
+            await prisma.recoveryCode.update({ where: { id: matchedCode.id }, data: { used: true } });
         }
 
         // 3. Verify Ownership
@@ -2419,8 +2454,8 @@ app.post('/api/recovery/execute', async (req, res) => {
         }
 
         // 6. Mark Recovery Code as used in Cloud
-        await cloudPrisma.recoveryCode.update({
-            where: { id: matchedCode.id },
+        await cloudPrisma.recoveryCode.updateMany({
+            where: { codeHash: matchedCode.codeHash },
             data: { used: true }
         });
 

@@ -148,6 +148,7 @@ async function runDirectSync(
                         }
                     });
                 } else {
+                    console.error(`[Sync Service] Restaurant upsert failed:`, upsertErr);
                     throw upsertErr;
                 }
             }
@@ -157,9 +158,13 @@ async function runDirectSync(
             } catch (err: any) {
                 console.warn(`[Sync Service] Secondary ActivationCode upsert failed: ${err.message}`);
             }
+        } else {
+            console.error(`[Sync Service] localRest is null for ID: ${restaurantId}`);
+            throw new Error(`localRest is null for ID: ${restaurantId}`);
         }
     } catch (err) {
         console.error(`Failed to sync restaurant ${restaurantId} directly to cloud:`, err);
+        return; // STOP sync if restaurant fails, to avoid cascading foreign key errors
     }
 
     // 1. Sync Categories
