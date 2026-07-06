@@ -313,6 +313,11 @@ model KitchenDeviceLink {
   status                     String   @default("LINKED") // LINKED | UNLINKED | REVOKED
 }
 
+enum SyncStatus {
+  PENDING_SYNC
+  PUBLISHED
+}
+
 model Coupon {
   id            String    @id @default(uuid())
   code          String
@@ -328,6 +333,7 @@ model Coupon {
   restaurant    Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @default(now()) @updatedAt
+  syncStatus    SyncStatus @default(PENDING_SYNC)
 
   @@index([restaurantId])
 }

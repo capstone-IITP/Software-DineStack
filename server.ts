@@ -2064,7 +2064,7 @@ app.patch('/api/orders/:id/status', authenticate, authorize(['KITCHEN', 'ADMIN']
 
 // --- Bidirectional Offline-First Order Sync Endpoint ---
 app.post('/api/sync/orders', async (req, res) => {
-    const { orders, tables, categories, menuItems } = req.body;
+    const { orders, tables, categories, menuItems, coupons } = req.body;
     let restaurantId: string | null = null;
 
     // Authenticate: Either via standard JWT or X-Activation-Code header
@@ -2186,6 +2186,49 @@ app.post('/api/sync/orders', async (req, res) => {
             }
         }
 
+        const syncedCouponIds: string[] = [];
+
+        // 4. Sync Coupons (Configuration Data only from local to cloud)
+        if (Array.isArray(coupons)) {
+            for (const coupon of coupons) {
+                try {
+                    await (prisma as any).coupon.upsert({
+                        where: { id: coupon.id },
+                        update: {
+                            code: coupon.code,
+                            discountType: coupon.discountType,
+                            discountValue: coupon.discountValue,
+                            minOrderValue: coupon.minOrderValue,
+                            maxDiscount: coupon.maxDiscount,
+                            maxUsage: coupon.maxUsage,
+                            expiresAt: coupon.expiresAt ? new Date(coupon.expiresAt) : null,
+                            status: coupon.status,
+                            // NEVER update cloud usageCount from local.
+                            updatedAt: coupon.updatedAt ? new Date(coupon.updatedAt) : new Date()
+                        },
+                        create: {
+                            id: coupon.id,
+                            code: coupon.code,
+                            discountType: coupon.discountType,
+                            discountValue: coupon.discountValue,
+                            minOrderValue: coupon.minOrderValue,
+                            maxDiscount: coupon.maxDiscount,
+                            maxUsage: coupon.maxUsage,
+                            expiresAt: coupon.expiresAt ? new Date(coupon.expiresAt) : null,
+                            status: coupon.status,
+                            restaurantId,
+                            usageCount: 0,
+                            createdAt: coupon.createdAt ? new Date(coupon.createdAt) : new Date(),
+                            updatedAt: coupon.updatedAt ? new Date(coupon.updatedAt) : new Date()
+                        }
+                    });
+                    syncedCouponIds.push(coupon.id);
+                } catch (err) {
+                    console.error(`Failed to sync coupon ${coupon.id} to cloud:`, err);
+                }
+            }
+        }
+
         const syncedOrderIds: string[] = [];
 
         for (const localOrder of orders) {
@@ -2276,10 +2319,17 @@ app.post('/api/sync/orders', async (req, res) => {
             }
         });
 
+        // Fetch all coupons from the cloud for this restaurant to sync down to desktop
+        const cloudCoupons = await (prisma as any).coupon.findMany({
+            where: { restaurantId }
+        });
+
         res.json({
             success: true,
             syncedOrderIds,
-            cloudOrders
+            cloudOrders,
+            syncedCouponIds,
+            cloudCoupons
         });
     } catch (error) {
         console.error('Order Sync Endpoint Error:', error);

@@ -47,7 +47,8 @@ async function runDirectSync(
     orders: any[],
     tables: any[],
     categories: any[],
-    menuItems: any[]
+    menuItems: any[],
+    coupons: any[]
 ) {
     if (!cloudPrisma) {
         throw new Error('Direct Cloud DB connection not initialized');
@@ -241,6 +242,48 @@ async function runDirectSync(
                 });
             } catch (err) {
                 console.error(`Failed to sync table ${tbl.id} directly to cloud:`, err);
+            }
+        }
+    }
+
+    // Sync Coupons (Configuration Data only from local to cloud)
+    const syncedCouponIds: string[] = [];
+    if (Array.isArray(coupons)) {
+        for (const coupon of coupons) {
+            try {
+                await cloudPrisma.coupon.upsert({
+                    where: { id: coupon.id },
+                    update: {
+                        code: coupon.code,
+                        discountType: coupon.discountType,
+                        discountValue: coupon.discountValue,
+                        minOrderValue: coupon.minOrderValue,
+                        maxDiscount: coupon.maxDiscount,
+                        maxUsage: coupon.maxUsage,
+                        expiresAt: coupon.expiresAt ? new Date(coupon.expiresAt) : null,
+                        status: coupon.status,
+                        // NEVER upload local usageCount to the cloud. Cloud is source of truth.
+                        updatedAt: coupon.updatedAt ? new Date(coupon.updatedAt) : new Date()
+                    },
+                    create: {
+                        id: coupon.id,
+                        code: coupon.code,
+                        discountType: coupon.discountType,
+                        discountValue: coupon.discountValue,
+                        minOrderValue: coupon.minOrderValue,
+                        maxDiscount: coupon.maxDiscount,
+                        maxUsage: coupon.maxUsage,
+                        expiresAt: coupon.expiresAt ? new Date(coupon.expiresAt) : null,
+                        status: coupon.status,
+                        restaurantId,
+                        usageCount: 0, // Starts at 0 in the cloud
+                        createdAt: coupon.createdAt ? new Date(coupon.createdAt) : new Date(),
+                        updatedAt: coupon.updatedAt ? new Date(coupon.updatedAt) : new Date()
+                    }
+                });
+                syncedCouponIds.push(coupon.id);
+            } catch (err) {
+                console.error(`Failed to sync coupon ${coupon.id} directly to cloud:`, err);
             }
         }
     }
@@ -465,10 +508,17 @@ async function runDirectSync(
         console.error('[Sync Service] Failed to sync Devices:', deviceSyncErr.message);
     }
 
+    // Fetch cloud coupons for sync down
+    const cloudCoupons = await cloudPrisma.coupon.findMany({
+        where: { restaurantId }
+    });
+
     return {
         success: true,
         syncedOrderIds,
-        cloudOrders
+        cloudOrders,
+        syncedCouponIds,
+        cloudCoupons
     };
 }
 
@@ -550,6 +600,10 @@ export async function runSync() {
             where: { restaurantId }
         });
 
+        const couponsToUpload = await prisma.coupon.findMany({
+            where: { restaurantId, syncStatus: 'PENDING_SYNC' }
+        });
+
         // 3. Post to cloud with direct DB fallback
         let data: any = null;
         if (useDirectSync && cloudPrisma) {
@@ -558,7 +612,8 @@ export async function runSync() {
                 ordersToUpload,
                 tablesToUpload,
                 categoriesToUpload,
-                menuItemsToUpload
+                menuItemsToUpload,
+                couponsToUpload
             );
         } else {
             try {
@@ -572,7 +627,8 @@ export async function runSync() {
                         orders: ordersToUpload,
                         tables: tablesToUpload,
                         categories: categoriesToUpload,
-                        menuItems: menuItemsToUpload
+                        menuItems: menuItemsToUpload,
+                        coupons: couponsToUpload
                     })
                 });
 
@@ -585,7 +641,8 @@ export async function runSync() {
                             ordersToUpload,
                             tablesToUpload,
                             categoriesToUpload,
-                            menuItemsToUpload
+                            menuItemsToUpload,
+                            couponsToUpload
                         );
                     } else {
                         throw new Error(`Cloud Sync failed with status: 404`);
@@ -603,7 +660,8 @@ export async function runSync() {
                         ordersToUpload,
                         tablesToUpload,
                         categoriesToUpload,
-                        menuItemsToUpload
+                        menuItemsToUpload,
+                        couponsToUpload
                     );
                 } else {
                     throw httpError;
@@ -738,6 +796,78 @@ export async function runSync() {
                 }
                 if (skippedCount > 0) {
                     console.warn(`[Sync Service] Skipped syncing down ${skippedCount} orders due to missing local constraints (tables/items).`);
+                }
+            }
+
+            // Sync Coupons Status & Download Cloud Coupons
+            if (data.syncedCouponIds && data.syncedCouponIds.length > 0) {
+                await prisma.coupon.updateMany({
+                    where: { id: { in: data.syncedCouponIds } },
+                    data: { syncStatus: 'PUBLISHED' }
+                });
+                console.log(`[Sync Service] Successfully uploaded ${data.syncedCouponIds.length} coupons.`);
+            }
+
+            if (data.cloudCoupons && data.cloudCoupons.length > 0) {
+                for (const cloudCoupon of data.cloudCoupons) {
+                    try {
+                        const localCoupon = await prisma.coupon.findUnique({
+                            where: { id: cloudCoupon.id }
+                        });
+
+                        if (!localCoupon) {
+                            // Coupon created directly in cloud, download it
+                            await prisma.coupon.create({
+                                data: {
+                                    id: cloudCoupon.id,
+                                    code: cloudCoupon.code,
+                                    discountType: cloudCoupon.discountType,
+                                    discountValue: cloudCoupon.discountValue,
+                                    minOrderValue: cloudCoupon.minOrderValue,
+                                    maxDiscount: cloudCoupon.maxDiscount,
+                                    maxUsage: cloudCoupon.maxUsage,
+                                    expiresAt: cloudCoupon.expiresAt ? new Date(cloudCoupon.expiresAt) : null,
+                                    status: cloudCoupon.status,
+                                    usageCount: cloudCoupon.usageCount,
+                                    restaurantId: cloudCoupon.restaurantId,
+                                    syncStatus: 'PUBLISHED',
+                                    createdAt: new Date(cloudCoupon.createdAt),
+                                    updatedAt: new Date(cloudCoupon.updatedAt)
+                                }
+                            });
+                        } else {
+                            // Update logic: Cloud is source of truth for usageCount
+                            const updateData: any = {
+                                usageCount: cloudCoupon.usageCount
+                            };
+
+                            // Only update configuration if cloud is newer
+                            const localUpdated = new Date(localCoupon.updatedAt).getTime();
+                            const cloudUpdated = new Date(cloudCoupon.updatedAt).getTime();
+                            if (cloudUpdated > localUpdated) {
+                                updateData.code = cloudCoupon.code;
+                                updateData.discountType = cloudCoupon.discountType;
+                                updateData.discountValue = cloudCoupon.discountValue;
+                                updateData.minOrderValue = cloudCoupon.minOrderValue;
+                                updateData.maxDiscount = cloudCoupon.maxDiscount;
+                                updateData.maxUsage = cloudCoupon.maxUsage;
+                                updateData.expiresAt = cloudCoupon.expiresAt ? new Date(cloudCoupon.expiresAt) : null;
+                                updateData.status = cloudCoupon.status;
+                                updateData.updatedAt = new Date(cloudCoupon.updatedAt);
+                            }
+
+                            // If this coupon was pending, check if cloud already has the latest updates 
+                            // If local is still newer, it will stay PENDING_SYNC for next round (handled by previous uploadedIds logic)
+                            // If it was already uploaded in this run, it's already set to PUBLISHED
+
+                            await prisma.coupon.update({
+                                where: { id: localCoupon.id },
+                                data: updateData
+                            });
+                        }
+                    } catch (err: any) {
+                        console.error(`[Sync Service] Failed to sync down coupon ${cloudCoupon.id}: ${err.message}`);
+                    }
                 }
             }
         }

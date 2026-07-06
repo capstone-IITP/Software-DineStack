@@ -433,8 +433,8 @@ app.post('/api/security/verify-admin-pin', authLimiter, async (req, res) => {
 });
 
 // Cloud API URLs for authentication (Next.js) and validation (Express)
-const CLOUD_AUTH_API_BASE = 'https://dinestack.in/api';
-const CLOUD_LICENSE_API_BASE = 'https://software.dinestack.in/api';
+const CLOUD_AUTH_API_BASE = process.env.CLOUD_AUTH_API_URL || 'https://dinestack.in/api';
+const CLOUD_LICENSE_API_BASE = process.env.CLOUD_API_URL || 'https://software.dinestack.in/api';
 
 
 // --- Restaurant Info Endpoint (Public) ---

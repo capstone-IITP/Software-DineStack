@@ -2,6 +2,7 @@ import express from 'express';
 import { prisma } from '../utils/prisma';
 import { authenticate } from '../middleware/auth';
 import { randomUUID } from 'crypto';
+import { runSync } from '../utils/sync-service';
 
 const router = express.Router();
 
@@ -49,9 +50,13 @@ router.post('/', authenticate, async (req: any, res) => {
                 minOrderValue,
                 maxDiscount,
                 maxUsage,
-                restaurantId
+                restaurantId,
+                syncStatus: 'PENDING_SYNC'
             }
         });
+
+        // Trigger immediate sync
+        setTimeout(() => runSync().catch(console.error), 0);
 
         res.json({ success: true, coupon });
     } catch (error: any) {
@@ -69,12 +74,15 @@ router.patch('/:id', authenticate, async (req: any, res) => {
 
         const coupon = await prisma.coupon.updateMany({
             where: { id, restaurantId },
-            data: { status }
+            data: { status, syncStatus: 'PENDING_SYNC' }
         });
 
         if (coupon.count === 0) {
             return res.status(404).json({ success: false, error: 'Coupon not found' });
         }
+
+        // Trigger immediate sync
+        setTimeout(() => runSync().catch(console.error), 0);
 
         res.json({ success: true });
     } catch (error) {
