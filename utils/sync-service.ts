@@ -60,10 +60,11 @@ async function runDirectSync(
             include: { ActivationCode: true }
         });
         
+        let cloudActivationCodeId: string | null = localRest?.activationCodeId || null;
         const upsertActivationCode = async (withRestaurantId: boolean) => {
             if (!localRest?.ActivationCode) return;
-            await cloudPrisma.activationCode.upsert({
-                where: { id: localRest.ActivationCode.id },
+            const upserted = await cloudPrisma.activationCode.upsert({
+                where: { code: localRest.ActivationCode.code },
                 update: {
                     code: localRest.ActivationCode.code,
                     status: localRest.ActivationCode.status,
@@ -88,6 +89,7 @@ async function runDirectSync(
                     ...(withRestaurantId && { restaurantId: restaurantId })
                 }
             });
+            cloudActivationCodeId = upserted.id;
         };
 
         try {
@@ -106,7 +108,7 @@ async function runDirectSync(
                         isActive: localRest.isActive,
                         adminPin: localRest.adminPin,
                         kitchenPin: localRest.kitchenPin,
-                        activationCodeId: localRest.activationCodeId
+                        activationCodeId: cloudActivationCodeId
                     },
                     create: {
                         id: localRest.id,
@@ -115,7 +117,7 @@ async function runDirectSync(
                         isActive: localRest.isActive,
                         adminPin: localRest.adminPin,
                         kitchenPin: localRest.kitchenPin,
-                        activationCodeId: localRest.activationCodeId,
+                        activationCodeId: cloudActivationCodeId,
                         createdAt: localRest.createdAt || new Date()
                     }
                 });
@@ -131,7 +133,7 @@ async function runDirectSync(
                             isActive: localRest.isActive,
                             adminPin: localRest.adminPin,
                             kitchenPin: localRest.kitchenPin,
-                            activationCodeId: localRest.activationCodeId
+                            activationCodeId: cloudActivationCodeId
                         },
                         create: {
                             id: localRest.id,
@@ -140,7 +142,7 @@ async function runDirectSync(
                             isActive: localRest.isActive,
                             adminPin: localRest.adminPin,
                             kitchenPin: localRest.kitchenPin,
-                            activationCodeId: localRest.activationCodeId,
+                            activationCodeId: cloudActivationCodeId,
                             createdAt: localRest.createdAt || new Date()
                         }
                     });
