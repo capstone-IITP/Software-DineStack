@@ -2689,7 +2689,7 @@ app.get('/api/customer/menu/:restaurantId', async (req, res) => {
 
 // 3️⃣ Create Order (Customer)
 app.post('/api/customer/orders', authenticate, authorize(['CUSTOMER']), validateTableSession, validate({ body: customerOrderSchema }), async (req, res) => {
-    const { items, idempotencyKey, tableId: bodyTableId, deviceToken } = req.body;
+    const { items, idempotencyKey, tableId: bodyTableId, deviceToken, couponCode } = req.body;
     const { restaurantId, tableId: tokenTableId } = (req as any).user;
 
     // Use tableId from token (preferred) or body (fallback)
@@ -2716,56 +2716,102 @@ app.post('/api/customer/orders', authenticate, authorize(['CUSTOMER']), validate
             return;
         }
 
-        // Prevent duplicates - check recent orders (10s window) for same table
-        const recentOrder = await (prisma as any).order.findFirst({
-            where: {
-                tableId,
-                createdAt: {
-                    gt: new Date(Date.now() - 10 * 1000)
+        // Use Prisma Transaction for order creation and coupon consumption
+        const order = await prisma.$transaction(async (tx: any) => {
+            // Prevent duplicates - check recent orders (10s window) for same table
+            const recentOrder = await tx.order.findFirst({
+                where: {
+                    tableId,
+                    createdAt: {
+                        gt: new Date(Date.now() - 10 * 1000)
+                    }
                 }
-            }
-        });
-
-        if (recentOrder) {
-            res.status(409).json({ error: 'Duplicate order detected. Please wait a moment.' });
-            return;
-        }
-
-        // Server-side validation of menu items and calculation of totalAmount
-        const dbItems = await prisma.menuItem.findMany({
-            where: {
-                id: { in: items.map((i: any) => i.menuItemId) },
-                restaurantId
-            }
-        });
-
-        if (dbItems.length !== items.length) {
-            res.status(400).json({ error: 'Some ordered items are invalid or unavailable' });
-            return;
-        }
-
-        let calculatedTotal = 0;
-        const itemCreates = [];
-
-        for (const item of items) {
-            const dbItem = dbItems.find(m => m.id === item.menuItemId);
-            if (!dbItem || !dbItem.isActive) {
-                res.status(400).json({ error: `Item ${item.menuItemId} is not currently active` });
-                return;
-            }
-            calculatedTotal += dbItem.price * item.quantity;
-            itemCreates.push({
-                menuItemId: item.menuItemId,
-                quantity: item.quantity
             });
-        }
 
-        // Handle Customer / Device Token
-        let customerId: string | undefined;
+            if (recentOrder) {
+                throw new Error('Duplicate order detected. Please wait a moment.');
+            }
 
-        if (deviceToken) {
-            try {
-                let customer = await prisma.customer.findUnique({
+            // Server-side validation of menu items and calculation of totalAmount
+            const dbItems = await tx.menuItem.findMany({
+                where: {
+                    id: { in: items.map((i: any) => i.menuItemId) },
+                    restaurantId
+                }
+            });
+
+            if (dbItems.length !== items.length) {
+                throw new Error('Some ordered items are invalid or unavailable');
+            }
+
+            let calculatedTotal = 0;
+            const itemCreates = [];
+
+            for (const item of items) {
+                const dbItem = dbItems.find((m: any) => m.id === item.menuItemId);
+                if (!dbItem || !dbItem.isActive) {
+                    throw new Error(`Item ${item.menuItemId} is not currently active`);
+                }
+                calculatedTotal += dbItem.price * item.quantity;
+                itemCreates.push({
+                    menuItemId: item.menuItemId,
+                    quantity: item.quantity
+                });
+            }
+            
+            // --- Coupon Validation & Application ---
+            let finalDiscountAmount = 0;
+            let appliedCoupon = null;
+
+            if (couponCode) {
+                const normalizedCode = couponCode.trim().toUpperCase();
+                const coupon = await tx.coupon.findFirst({
+                    where: { code: normalizedCode, restaurantId }
+                });
+
+                if (!coupon) {
+                    throw new Error('Coupon not found for this restaurant');
+                }
+                if (coupon.status !== 'ACTIVE') {
+                    throw new Error('Coupon is disabled');
+                }
+                if (coupon.expiresAt && new Date(coupon.expiresAt) < new Date()) {
+                    throw new Error('Coupon has expired');
+                }
+                if (coupon.maxUsage && coupon.usageCount >= coupon.maxUsage) {
+                    throw new Error('Coupon usage limit reached');
+                }
+                if (coupon.minOrderValue && calculatedTotal < coupon.minOrderValue) {
+                    throw new Error(`Minimum order of ₹${coupon.minOrderValue} required`);
+                }
+
+                if (coupon.discountType === 'PERCENTAGE') {
+                    finalDiscountAmount = calculatedTotal * (coupon.discountValue / 100);
+                    if (coupon.maxDiscount && finalDiscountAmount > coupon.maxDiscount) {
+                        finalDiscountAmount = coupon.maxDiscount;
+                    }
+                } else if (coupon.discountType === 'FLAT') {
+                    finalDiscountAmount = coupon.discountValue;
+                }
+
+                if (finalDiscountAmount > calculatedTotal) {
+                    finalDiscountAmount = calculatedTotal;
+                }
+                
+                appliedCoupon = coupon;
+
+                // Increment usage counter inside transaction
+                await tx.coupon.update({
+                    where: { id: coupon.id },
+                    data: { usageCount: { increment: 1 } }
+                });
+            }
+
+            // Handle Customer / Device Token
+            let customerId: string | undefined;
+
+            if (deviceToken) {
+                let customer = await tx.customer.findUnique({
                     where: {
                         deviceToken_restaurantId: {
                             deviceToken,
@@ -2775,66 +2821,71 @@ app.post('/api/customer/orders', authenticate, authorize(['CUSTOMER']), validate
                 });
 
                 if (!customer) {
-                    customer = await prisma.customer.create({
+                    customer = await tx.customer.create({
                         data: {
                             deviceToken,
                             restaurantId
                         }
                     });
                 }
-
                 customerId = customer.id;
-            } catch (e) {
-                console.error("Failed to link customer:", e);
             }
-        }
 
-        const platformFee = 10;
-        let subtotal = calculatedTotal;
-        let gstAmount = 0;
-        let grandTotal = calculatedTotal + platformFee;
-        let effectiveGstRate = null;
-        let gstMode = null;
+            const platformFee = 10;
+            let subtotal = calculatedTotal;
+            let taxableAmount = Math.max(0, subtotal - finalDiscountAmount);
+            let gstAmount = 0;
+            let grandTotal = taxableAmount + platformFee;
+            let effectiveGstRate = null;
+            let gstMode = null;
 
-        if ((restaurant as any).gstEnabled) {
-            effectiveGstRate = (restaurant as any).defaultGstRate || 5;
-            gstMode = (restaurant as any).gstMode || 'EXCLUSIVE';
+            if ((restaurant as any).gstEnabled) {
+                effectiveGstRate = (restaurant as any).defaultGstRate || 5;
+                gstMode = (restaurant as any).gstMode || 'EXCLUSIVE';
 
-            if (gstMode === 'EXCLUSIVE') {
-                gstAmount = subtotal * (effectiveGstRate / 100);
-                grandTotal = subtotal + gstAmount + platformFee;
-            } else {
-                // INCLUSIVE: subtotal includes the GST
-                gstAmount = subtotal - (subtotal / (1 + effectiveGstRate / 100));
-                // To keep subtotal representing the true pre-tax amount in inclusive:
-                // subtotal = subtotal - gstAmount; // Optional, depending on accounting preference
-                grandTotal = subtotal + platformFee; // The original calculatedTotal already has tax inside it
-            }
-        }
-
-        const order = await (prisma as any).order.create({
-            data: {
-                restaurantId,
-                tableId,
-                customerId,
-                totalAmount: grandTotal, // Fallback for backwards compat
-                subtotal: subtotal,
-                gstAmount: gstAmount,
-                grandTotal: grandTotal,
-                effectiveGstRate: effectiveGstRate,
-                gstMode: gstMode,
-                status: 'RECEIVED',
-                items: {
-                    create: itemCreates
+                if (gstMode === 'EXCLUSIVE') {
+                    gstAmount = taxableAmount * (effectiveGstRate / 100);
+                    grandTotal = taxableAmount + gstAmount + platformFee;
+                } else {
+                    gstAmount = taxableAmount - (taxableAmount / (1 + effectiveGstRate / 100));
+                    grandTotal = taxableAmount + platformFee; 
                 }
-            },
-            include: { items: true }
+            }
+
+            return await tx.order.create({
+                data: {
+                    restaurantId,
+                    tableId,
+                    customerId,
+                    totalAmount: grandTotal,
+                    subtotal: subtotal,
+                    gstAmount: gstAmount,
+                    grandTotal: grandTotal,
+                    effectiveGstRate: effectiveGstRate,
+                    gstMode: gstMode,
+                    status: 'RECEIVED',
+                    couponId: appliedCoupon?.id || null,
+                    couponCode: appliedCoupon?.code || null,
+                    couponType: appliedCoupon?.discountType || null,
+                    couponValue: appliedCoupon?.discountValue || null,
+                    discountAmount: finalDiscountAmount,
+                    items: {
+                        create: itemCreates
+                    }
+                },
+                include: { items: true }
+            });
         });
 
         res.json({ success: true, order });
     } catch (error: any) {
         console.error('Create Order Error:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        // Distinguish business logic errors from Prisma Transaction errors
+        if (error.message && !error.message.includes('prisma')) {
+             res.status(400).json({ error: error.message });
+        } else {
+             res.status(500).json({ error: 'Internal Server Error' });
+        }
     }
 });
 

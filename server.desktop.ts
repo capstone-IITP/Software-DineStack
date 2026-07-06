@@ -1655,7 +1655,7 @@ app.post('/api/security/verify-admin-pin', authenticate, authorize(['ADMIN']), a
 
 // 3. Create Order (Protected by Table Session)
 app.post('/api/customer/orders', validateTableSession, async (req, res) => {
-    const { orderDetails, customerInfo, items } = req.body;
+    const { orderDetails, customerInfo, items, couponCode } = req.body;
     const user = (req as any).user;
 
     // Hardened check: Ensure User Table ID matches Session Table ID
@@ -1675,61 +1675,147 @@ app.post('/api/customer/orders', validateTableSession, async (req, res) => {
             where: { id: user.restaurantId }
         });
 
-        const menuItems = await prisma.menuItem.findMany({
-            where: { id: { in: orderItems.map((i: any) => i.id || i.menuItemId) } },
-            include: { Category: true }
-        });
+        // Use Prisma Transaction
+        const newOrder = await prisma.$transaction(async (tx: any) => {
+            const menuItems = await tx.menuItem.findMany({
+                where: { id: { in: orderItems.map((i: any) => i.id || i.menuItemId) } },
+                include: { Category: true }
+            });
 
-        const taxItems = orderItems.map((item: any) => {
-            const dbItem = menuItems.find(m => m.id === (item.id || item.menuItemId));
-            return {
-                price: dbItem?.price || item.price,
-                quantity: item.quantity,
-                taxSource: dbItem?.taxSource,
-                gstRate: dbItem?.gstRate,
-                categoryUseRestaurantGST: dbItem?.Category?.useRestaurantGST,
-                categoryGstRate: dbItem?.Category?.gstRate
-            };
-        });
+            // Basic item total before tax
+            let calculatedTotal = 0;
+            const validOrderItems = [];
 
-        const taxConfig = {
-            gstEnabled: restaurant?.gstEnabled || false,
-            gstMode: restaurant?.gstMode || 'EXCLUSIVE',
-            defaultGstRate: restaurant?.defaultGstRate || 5.0
-        };
-
-        const { calculateOrderTaxes } = require('../utils/taxEngine');
-        const taxResult = calculateOrderTaxes(taxItems, taxConfig);
-
-        // Create the order
-        const newOrder = await prisma.order.create({
-            data: {
-                id: randomUUID(),
-                restaurantId: user.restaurantId,
-                tableId: user.tableId,
-                status: 'RECEIVED',
-                subtotal: taxResult.subtotal,
-                gstAmount: taxResult.gstAmount,
-                grandTotal: taxResult.grandTotal,
-                totalAmount: taxResult.grandTotal, // backward compatibility
-                effectiveGstRate: taxResult.effectiveGstRate,
-                gstMode: taxResult.gstMode,
-                updatedAt: new Date(),
-                // Create related OrderItems
-                OrderItem: {
-                    create: orderItems.map((item: any) => ({
-                        id: randomUUID(),
-                        menuItemId: item.id || item.menuItemId,
-                        quantity: item.quantity,
-                        notes: item.notes
-                    }))
+            const taxItems = orderItems.map((item: any) => {
+                const dbItem = menuItems.find((m: any) => m.id === (item.id || item.menuItemId));
+                if (!dbItem) {
+                    throw new Error(`Item ${item.id || item.menuItemId} is not currently active or available`);
                 }
-            },
-            include: {
-                // Include items and table for response/socket
-                OrderItem: { include: { MenuItem: true } }, // PascalCase or match normalize
-                Table: true
+                const price = dbItem.price;
+                calculatedTotal += price * item.quantity;
+                validOrderItems.push({
+                    id: randomUUID(),
+                    menuItemId: dbItem.id,
+                    quantity: item.quantity,
+                    notes: item.notes
+                });
+
+                return {
+                    price: price,
+                    quantity: item.quantity,
+                    taxSource: dbItem.taxSource,
+                    gstRate: dbItem.gstRate,
+                    categoryUseRestaurantGST: dbItem.Category?.useRestaurantGST,
+                    categoryGstRate: dbItem.Category?.gstRate
+                };
+            });
+
+            // --- Coupon Validation & Application ---
+            let finalDiscountAmount = 0;
+            let appliedCoupon = null;
+
+            if (couponCode) {
+                const normalizedCode = couponCode.trim().toUpperCase();
+                const coupon = await tx.coupon.findFirst({
+                    where: { code: normalizedCode, restaurantId: user.restaurantId }
+                });
+
+                if (!coupon) {
+                    throw new Error('Coupon not found for this restaurant');
+                }
+                if (coupon.status !== 'ACTIVE') {
+                    throw new Error('Coupon is disabled');
+                }
+                if (coupon.expiresAt && new Date(coupon.expiresAt) < new Date()) {
+                    throw new Error('Coupon has expired');
+                }
+                if (coupon.maxUsage && coupon.usageCount >= coupon.maxUsage) {
+                    throw new Error('Coupon usage limit reached');
+                }
+                if (coupon.minOrderValue && calculatedTotal < coupon.minOrderValue) {
+                    throw new Error(`Minimum order of ₹${coupon.minOrderValue} required`);
+                }
+
+                if (coupon.discountType === 'PERCENTAGE') {
+                    finalDiscountAmount = calculatedTotal * (coupon.discountValue / 100);
+                    if (coupon.maxDiscount && finalDiscountAmount > coupon.maxDiscount) {
+                        finalDiscountAmount = coupon.maxDiscount;
+                    }
+                } else if (coupon.discountType === 'FLAT') {
+                    finalDiscountAmount = coupon.discountValue;
+                }
+
+                if (finalDiscountAmount > calculatedTotal) {
+                    finalDiscountAmount = calculatedTotal;
+                }
+                
+                appliedCoupon = coupon;
+
+                // Increment usage counter inside transaction
+                await tx.coupon.update({
+                    where: { id: coupon.id },
+                    data: { usageCount: { increment: 1 } }
+                });
             }
+
+            const taxConfig = {
+                gstEnabled: restaurant?.gstEnabled || false,
+                gstMode: restaurant?.gstMode || 'EXCLUSIVE',
+                defaultGstRate: restaurant?.defaultGstRate || 5.0
+            };
+
+            const { calculateOrderTaxes } = require('../utils/taxEngine');
+            // taxEngine doesn't easily support cart-level discounts inside the loop,
+            // so we calculate standard taxes, and then manually adjust the taxable amount.
+            // Since this is complex, we will apply discount proportionally.
+            let taxResult = calculateOrderTaxes(taxItems, taxConfig);
+
+            let finalSubtotal = calculatedTotal;
+            let finalGstAmount = taxResult.gstAmount;
+            let finalGrandTotal = taxResult.grandTotal;
+
+            if (finalDiscountAmount > 0) {
+                // Adjust tax proportionally to the discount
+                const discountRatio = finalDiscountAmount / calculatedTotal;
+                finalGstAmount = finalGstAmount * (1 - discountRatio);
+                
+                if (taxConfig.gstMode === 'EXCLUSIVE') {
+                    finalGrandTotal = (calculatedTotal - finalDiscountAmount) + finalGstAmount;
+                } else {
+                    finalGrandTotal = (calculatedTotal - finalDiscountAmount);
+                }
+            }
+
+            // Create the order
+            return await tx.order.create({
+                data: {
+                    id: randomUUID(),
+                    restaurantId: user.restaurantId,
+                    tableId: user.tableId,
+                    status: 'RECEIVED',
+                    subtotal: finalSubtotal,
+                    gstAmount: finalGstAmount,
+                    grandTotal: finalGrandTotal,
+                    totalAmount: finalGrandTotal, // backward compatibility
+                    effectiveGstRate: taxResult.effectiveGstRate,
+                    gstMode: taxResult.gstMode,
+                    updatedAt: new Date(),
+                    couponId: appliedCoupon?.id || null,
+                    couponCode: appliedCoupon?.code || null,
+                    couponType: appliedCoupon?.discountType || null,
+                    couponValue: appliedCoupon?.discountValue || null,
+                    discountAmount: finalDiscountAmount,
+                    // Create related OrderItems
+                    OrderItem: {
+                        create: validOrderItems
+                    }
+                },
+                include: {
+                    // Include items and table for response/socket
+                    OrderItem: { include: { MenuItem: true } },
+                    Table: true
+                }
+            });
         });
 
         // Emit socket event
@@ -1742,9 +1828,13 @@ app.post('/api/customer/orders', validateTableSession, async (req, res) => {
         }
 
         res.json({ success: true, order: normalize(newOrder), message: 'Order placed successfully' });
-    } catch (error) {
+    } catch (error: any) {
         console.error('Place Order Error:', error);
-        res.status(500).json({ error: 'Failed to place order' });
+        if (error.message && !error.message.includes('prisma')) {
+             res.status(400).json({ error: error.message });
+        } else {
+             res.status(500).json({ error: 'Failed to place order' });
+        }
     }
 });
 
@@ -3688,7 +3778,7 @@ app.get('/api/customer/menu/:restaurantId', async (req, res) => {
 
 app.post('/api/customer/orders', authenticate, authorize(['CUSTOMER']), async (req, res) => {
     console.log(`[API] POST /api/customer/orders HIT. STARTING...`);
-    const { items } = req.body; // items: [{menuItemId, quantity, price}]
+    const { items, couponCode } = req.body; // items: [{menuItemId, quantity, price}]
     const { tableId: bodyTableId } = req.body;
 
     // Get context from token (preferred)
@@ -3714,62 +3804,120 @@ app.post('/api/customer/orders', authenticate, authorize(['CUSTOMER']), async (r
             where: { id: restaurantId }
         });
 
-        // Calculate total amount (Serverside trust)
-        let calculatedTotal = 0;
-        const validItems = [];
+        // Use Prisma Transaction for order creation and coupon consumption
+        const order = await prisma.$transaction(async (tx: any) => {
+            let calculatedTotal = 0;
+            const validItems = [];
 
-        for (const item of items) {
-            const menuItem = await prisma.menuItem.findUnique({
-                where: { id: item.menuItemId }
-            });
-            if (menuItem) {
-                calculatedTotal += menuItem.price * item.quantity;
-                validItems.push({
-                    id: randomUUID(),
-                    menuItemId: item.menuItemId,
-                    quantity: item.quantity
+            for (const item of items) {
+                const menuItem = await tx.menuItem.findUnique({
+                    where: { id: item.menuItemId }
+                });
+                if (menuItem) {
+                    calculatedTotal += menuItem.price * item.quantity;
+                    validItems.push({
+                        id: randomUUID(),
+                        menuItemId: item.menuItemId,
+                        quantity: item.quantity
+                    });
+                } else {
+                    throw new Error(`Item ${item.menuItemId} is not currently active or available`);
+                }
+            }
+            
+            // --- Coupon Validation & Application ---
+            let finalDiscountAmount = 0;
+            let appliedCoupon = null;
+
+            if (couponCode) {
+                const normalizedCode = couponCode.trim().toUpperCase();
+                const coupon = await tx.coupon.findFirst({
+                    where: { code: normalizedCode, restaurantId }
+                });
+
+                if (!coupon) {
+                    throw new Error('Coupon not found for this restaurant');
+                }
+                if (coupon.status !== 'ACTIVE') {
+                    throw new Error('Coupon is disabled');
+                }
+                if (coupon.expiresAt && new Date(coupon.expiresAt) < new Date()) {
+                    throw new Error('Coupon has expired');
+                }
+                if (coupon.maxUsage && coupon.usageCount >= coupon.maxUsage) {
+                    throw new Error('Coupon usage limit reached');
+                }
+                if (coupon.minOrderValue && calculatedTotal < coupon.minOrderValue) {
+                    throw new Error(`Minimum order of ₹${coupon.minOrderValue} required`);
+                }
+
+                if (coupon.discountType === 'PERCENTAGE') {
+                    finalDiscountAmount = calculatedTotal * (coupon.discountValue / 100);
+                    if (coupon.maxDiscount && finalDiscountAmount > coupon.maxDiscount) {
+                        finalDiscountAmount = coupon.maxDiscount;
+                    }
+                } else if (coupon.discountType === 'FLAT') {
+                    finalDiscountAmount = coupon.discountValue;
+                }
+
+                if (finalDiscountAmount > calculatedTotal) {
+                    finalDiscountAmount = calculatedTotal;
+                }
+                
+                appliedCoupon = coupon;
+
+                // Increment usage counter inside transaction
+                await tx.coupon.update({
+                    where: { id: coupon.id },
+                    data: { usageCount: { increment: 1 } }
                 });
             }
-        }
 
-        const platformFee = 10;
-        let subtotal = calculatedTotal;
-        let gstAmount = 0;
-        let grandTotal = calculatedTotal + platformFee;
-        let effectiveGstRate = null;
-        let gstMode = null;
+            const platformFee = 10;
+            let subtotal = calculatedTotal;
+            let taxableAmount = Math.max(0, subtotal - finalDiscountAmount);
+            let gstAmount = 0;
+            let grandTotal = taxableAmount + platformFee;
+            let effectiveGstRate = null;
+            let gstMode = null;
 
-        if (restaurant && restaurant.gstEnabled) {
-            effectiveGstRate = restaurant.defaultGstRate || 5;
-            gstMode = restaurant.gstMode || 'EXCLUSIVE';
+            if (restaurant && (restaurant as any).gstEnabled) {
+                effectiveGstRate = (restaurant as any).defaultGstRate || 5;
+                gstMode = (restaurant as any).gstMode || 'EXCLUSIVE';
 
-            if (gstMode === 'EXCLUSIVE') {
-                gstAmount = subtotal * (effectiveGstRate / 100);
-                grandTotal = subtotal + gstAmount + platformFee;
-            } else {
-                gstAmount = subtotal - (subtotal / (1 + effectiveGstRate / 100));
-                grandTotal = subtotal + platformFee;
-            }
-        }
-
-        const order = await prisma.order.create({
-            data: {
-                id: randomUUID(),
-                restaurantId,
-                tableId,
-                totalAmount: grandTotal, // Fallback for backwards compat
-                subtotal: subtotal,
-                gstAmount: gstAmount,
-                grandTotal: grandTotal,
-                effectiveGstRate: effectiveGstRate,
-                gstMode: gstMode,
-                status: 'RECEIVED',
-                updatedAt: new Date(),
-                OrderItem: {
-                    create: validItems
+                if (gstMode === 'EXCLUSIVE') {
+                    gstAmount = taxableAmount * (effectiveGstRate / 100);
+                    grandTotal = taxableAmount + gstAmount + platformFee;
+                } else {
+                    gstAmount = taxableAmount - (taxableAmount / (1 + effectiveGstRate / 100));
+                    grandTotal = taxableAmount + platformFee;
                 }
-            },
-            include: { OrderItem: true }
+            }
+
+            return await tx.order.create({
+                data: {
+                    id: randomUUID(),
+                    restaurantId,
+                    tableId,
+                    totalAmount: grandTotal, // Fallback for backwards compat
+                    subtotal: subtotal,
+                    gstAmount: gstAmount,
+                    grandTotal: grandTotal,
+                    effectiveGstRate: effectiveGstRate,
+                    gstMode: gstMode,
+                    status: 'RECEIVED',
+                    updatedAt: new Date(),
+                    couponId: appliedCoupon?.id || null,
+                    couponCode: appliedCoupon?.code || null,
+                    couponType: appliedCoupon?.discountType || null,
+                    couponValue: appliedCoupon?.discountValue || null,
+                    discountAmount: finalDiscountAmount,
+                    OrderItem: {
+                        create: validItems
+                    }
+                },
+                include: { OrderItem: true }
+            });
         });
 
         // --- Socket.IO: Emit new-order event ---

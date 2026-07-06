@@ -108,7 +108,10 @@ model Order {
   gstMode      String?
 
   // Discount fields
+  couponId       String?
   couponCode     String?
+  couponType     String?
+  couponValue    Float?
   discountAmount Float       @default(0)
 
   Restaurant   Restaurant  @relation(fields: [restaurantId], references: [id])

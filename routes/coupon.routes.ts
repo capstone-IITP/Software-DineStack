@@ -30,8 +30,10 @@ router.post('/', authenticate, async (req: any, res) => {
             return res.status(400).json({ success: false, error: 'Missing required fields' });
         }
 
+        const normalizedCode = code.trim().toUpperCase();
+
         const existing = await prisma.coupon.findFirst({
-            where: { code: code.toUpperCase(), restaurantId }
+            where: { code: normalizedCode, restaurantId }
         });
 
         if (existing) {
@@ -40,7 +42,7 @@ router.post('/', authenticate, async (req: any, res) => {
 
         const coupon = await prisma.coupon.create({
             data: {
-                code: code.toUpperCase(),
+                code: normalizedCode,
                 discountType,
                 discountValue,
                 expiresAt: expiresAt ? new Date(expiresAt) : null,
@@ -78,6 +80,40 @@ router.patch('/:id', authenticate, async (req: any, res) => {
     } catch (error) {
         console.error('Error updating coupon:', error);
         res.status(500).json({ success: false, error: 'Failed to update coupon' });
+    }
+});
+
+// DELETE delete coupon (or disable if used)
+router.delete('/:id', authenticate, async (req: any, res) => {
+    try {
+        const restaurantId = req.user.restaurantId;
+        const { id } = req.params;
+
+        const coupon = await prisma.coupon.findFirst({
+            where: { id, restaurantId }
+        });
+
+        if (!coupon) {
+            return res.status(404).json({ success: false, error: 'Coupon not found' });
+        }
+
+        if (coupon.usageCount > 0) {
+            // Soft delete - disable it to preserve historical integrity
+            await prisma.coupon.update({
+                where: { id },
+                data: { status: 'DISABLED' }
+            });
+            return res.json({ success: true, message: 'Coupon disabled (cannot delete because it has usage history)' });
+        } else {
+            // Hard delete
+            await prisma.coupon.delete({
+                where: { id }
+            });
+            return res.json({ success: true, message: 'Coupon deleted successfully' });
+        }
+    } catch (error) {
+        console.error('Error deleting coupon:', error);
+        res.status(500).json({ success: false, error: 'Failed to delete coupon' });
     }
 });
 
@@ -122,31 +158,47 @@ router.post('/validate', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Missing required fields' });
         }
 
+        const normalizedCode = code.trim().toUpperCase();
+
+        // First check if the coupon exists at all (global lookup to see if it's the wrong restaurant)
+        const anyCoupon = await prisma.coupon.findFirst({
+            where: { code: normalizedCode }
+        });
+
+        if (!anyCoupon) {
+            return res.json({ success: false, error: 'Coupon not found' });
+        }
+
+        if (anyCoupon.restaurantId !== restaurantId) {
+            return res.json({ success: false, error: 'Coupon belongs to another restaurant' });
+        }
+
         const coupon = await prisma.coupon.findFirst({
             where: {
-                code: code.toUpperCase(),
+                code: normalizedCode,
                 restaurantId
             }
         });
 
         if (!coupon) {
-            return res.json({ success: false, error: 'Invalid coupon code' });
+            // Should theoretically never hit this given the check above, but for safety
+            return res.json({ success: false, error: 'Coupon not found for this restaurant' });
         }
 
         if (coupon.status !== 'ACTIVE') {
-            return res.json({ success: false, error: 'Coupon is not active' });
+            return res.json({ success: false, error: 'Coupon disabled' });
         }
 
         if (coupon.expiresAt && new Date(coupon.expiresAt) < new Date()) {
-            return res.json({ success: false, error: 'Coupon has expired' });
+            return res.json({ success: false, error: 'Coupon expired' });
         }
 
         if (coupon.maxUsage && coupon.usageCount >= coupon.maxUsage) {
-            return res.json({ success: false, error: 'Coupon usage limit reached' });
+            return res.json({ success: false, error: 'Coupon already used' });
         }
 
         if (coupon.minOrderValue && subtotal < coupon.minOrderValue) {
-            return res.json({ success: false, error: `Minimum order value of ₹${coupon.minOrderValue} required` });
+            return res.json({ success: false, error: `Minimum order ₹${coupon.minOrderValue} required` });
         }
 
         // Calculate discount

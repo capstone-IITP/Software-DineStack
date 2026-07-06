@@ -219,7 +219,10 @@ model Order {
   gstMode      String?
 
   // Discount fields
+  couponId       String?
   couponCode     String?
+  couponType     String?
+  couponValue    Float?
   discountAmount Float       @default(0)
 
   customerId   String?
