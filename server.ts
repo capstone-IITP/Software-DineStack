@@ -2205,6 +2205,16 @@ app.post('/api/sync/orders', async (req, res) => {
                             tableId: localOrder.tableId,
                             status: localOrder.status,
                             totalAmount: localOrder.totalAmount,
+                            subtotal: localOrder.subtotal || 0,
+                            gstAmount: localOrder.gstAmount || 0,
+                            grandTotal: localOrder.grandTotal || 0,
+                            effectiveGstRate: localOrder.effectiveGstRate || null,
+                            gstMode: localOrder.gstMode || null,
+                            couponId: localOrder.couponId || null,
+                            couponCode: localOrder.couponCode || null,
+                            couponType: localOrder.couponType || null,
+                            couponValue: localOrder.couponValue || null,
+                            discountAmount: localOrder.discountAmount || 0,
                             customerId: localOrder.customerId || null,
                             createdAt: new Date(localOrder.createdAt),
                             updatedAt: new Date(localOrder.updatedAt),
@@ -2231,6 +2241,16 @@ app.post('/api/sync/orders', async (req, res) => {
                             data: {
                                 status: localOrder.status,
                                 totalAmount: localOrder.totalAmount,
+                                subtotal: localOrder.subtotal || 0,
+                                gstAmount: localOrder.gstAmount || 0,
+                                grandTotal: localOrder.grandTotal || 0,
+                                effectiveGstRate: localOrder.effectiveGstRate || null,
+                                gstMode: localOrder.gstMode || null,
+                                couponId: localOrder.couponId || null,
+                                couponCode: localOrder.couponCode || null,
+                                couponType: localOrder.couponType || null,
+                                couponValue: localOrder.couponValue || null,
+                                discountAmount: localOrder.discountAmount || 0,
                                 updatedAt: new Date(localOrder.updatedAt)
                             }
                         });
