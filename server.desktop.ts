@@ -248,6 +248,26 @@ app.use((req, res, next) => {
     }
     next();
 });
+
+// --- Backup Lock System State & Middleware ---
+let isBackupLocked = false;
+let backupLockId: string | null = null;
+
+app.use((req, res, next) => {
+    if (isBackupLocked) {
+        // Prevent all write operations during backup
+        const stateChangingMethods = ['POST', 'PATCH', 'PUT', 'DELETE'];
+        // Allow unlocking and status checks
+        const allowedPaths = ['/api/system/backup-unlock', '/api/system/status', '/api/system/updater-unlock'];
+        
+        if (stateChangingMethods.includes(req.method) && !allowedPaths.includes(req.path)) {
+            console.warn(`[Backup Lock] Blocked write attempt to ${req.path}`);
+            return res.status(503).json({ error: 'System is currently locked for backup. Please wait.', backupLocked: true });
+        }
+    }
+    next();
+});
+
 const httpServer = http.createServer(app);
 const io = new SocketServer(httpServer, {
     cors: {
@@ -288,6 +308,7 @@ function normalize(obj: any): any {
         else if (key === 'Restaurant' && !Array.isArray(val)) newKey = 'restaurant';
         else if (key === 'ActivationCode' && !Array.isArray(val)) newKey = 'activationCode';
         else if (key === 'OrderItem' && !Array.isArray(val)) newKey = 'orderItem';
+        else if (key === 'MenuItemVariant' && Array.isArray(val)) newKey = 'variants';
         out[newKey] = normalize(val);
     }
     return out;
@@ -695,6 +716,40 @@ app.get('/api/system/status', async (req, res) => {
         console.error('System Status Check Failed:', error);
         res.status(500).json({ error: 'System Error' });
     }
+});
+
+// --- Updater Lock System ---
+app.post('/api/system/updater-lock', (req, res) => {
+    console.log('[Updater] Locking system for critical update...');
+    io.emit('SYSTEM_UPDATING', { status: 'locked', message: 'Main Server is updating...' });
+    res.json({ success: true });
+});
+
+app.post('/api/system/updater-unlock', (req, res) => {
+    console.log('[Updater] Unlocking system after update...');
+    io.emit('UPDATE_COMPLETE', { status: 'unlocked' });
+    res.json({ success: true });
+});
+
+// --- Backup Lock System Endpoints ---
+app.post('/api/system/backup-lock', (req, res) => {
+    const { backupId } = req.body;
+    if (!backupId) {
+        return res.status(400).json({ error: 'backupId is required' });
+    }
+    console.log(`[Backup Lock] Acquiring backup lock for ID: ${backupId}`);
+    isBackupLocked = true;
+    backupLockId = backupId;
+    io.emit('BACKUP_STARTED', { status: 'locked', backupId });
+    res.json({ success: true, message: 'Backup lock acquired' });
+});
+
+app.post('/api/system/backup-unlock', (req, res) => {
+    console.log(`[Backup Lock] Releasing backup lock (ID: ${backupLockId})`);
+    isBackupLocked = false;
+    backupLockId = null;
+    io.emit('BACKUP_COMPLETED', { status: 'unlocked' });
+    res.json({ success: true, message: 'Backup lock released' });
 });
 
 // --- Module 4 & 6: Authentication (Cookie Helpers & Session Management) ---
@@ -1334,21 +1389,7 @@ app.post('/api/activate', async (req, res) => {
         });
         console.log(`[SaaS Activation] Revoked ${revokeResult.count} local restaurant(s).`);
 
-        // If cloud generated a new restaurant ID for a new license, migrate local data first
-        if (currentlyActive && currentlyActive.id !== cloudRestaurantId) {
-            console.log(`[SaaS Activation] Migrating local data from ${currentlyActive.id} to new cloud ID ${cloudRestaurantId}`);
-            const entities = ['category', 'menuItem', 'table', 'order', 'device', 'session', 'tableSession', 'recoveryCode', 'customer', 'refreshToken'];
-            for (const entity of entities) {
-                try {
-                    await (prisma as any)[entity].updateMany({
-                        where: { restaurantId: currentlyActive.id },
-                        data: { restaurantId: cloudRestaurantId }
-                    });
-                } catch (e) { console.warn(`Migration of ${entity} failed:`, e); }
-            }
-            // Attempt to clean up old restaurant to avoid duplicate confusion
-            try { await prisma.restaurant.delete({ where: { id: currentlyActive.id } }); } catch (e) { }
-        }
+
 
         // 1. Upsert Restaurant locally WITHOUT activationCodeId to avoid foreign key constraints
         let localRestaurant = await prisma.restaurant.upsert({
@@ -1392,6 +1433,23 @@ app.post('/api/activate', async (req, res) => {
                 }
             });
         }
+
+        // If cloud generated a new restaurant ID for a new license, migrate local data
+        if (currentlyActive && currentlyActive.id !== cloudRestaurantId) {
+            console.log(`[SaaS Activation] Migrating local data from ${currentlyActive.id} to new cloud ID ${cloudRestaurantId}`);
+            const entities = ['category', 'menuItem', 'table', 'order', 'device', 'session', 'tableSession', 'recoveryCode', 'customer', 'refreshToken'];
+            for (const entity of entities) {
+                try {
+                    await (prisma as any)[entity].updateMany({
+                        where: { restaurantId: currentlyActive.id },
+                        data: { restaurantId: cloudRestaurantId }
+                    });
+                } catch (e) { console.warn(`Migration of ${entity} failed:`, e); }
+            }
+            // Attempt to clean up old restaurant to avoid duplicate confusion
+            try { await prisma.restaurant.delete({ where: { id: currentlyActive.id } }); } catch (e) { }
+        }
+
 
         // 2. Upsert ActivationCode locally
         const localCodeId = randomUUID();
@@ -1497,31 +1555,31 @@ function compareCodesCharByChar(sent: string, stored: string, sourceName: string
 
 // (Duplicate isWeakPin and setup-pin declarations consolidated and removed)
 
+import { EntityDeletionManager } from './saga/EntityDeletionManager';
+
 // --- Module 0.5: System Factory Reset (Unlink Device) ---
-// Allows resetting the device to factory state (Activation Screen)
-// SOFT RESET: Does NOT delete data, just unlinks the device by setting status to REVOKED.
+// HARD RESET: Deletes all local data via Distributed Saga.
 app.post('/api/system/reset', async (req, res) => {
     try {
-        console.log('⚠️ SYSTEM UNLINK INITIATED (Soft Reset) ...');
-
-        // FORCE REVOKE ALL ACTIVE RESTAURANTS
-        // This is the most robust way to ensure we don't have "Ghost" active sessions.
-        const result = await prisma.restaurant.updateMany({
-            where: { status: { in: ['ACTIVE', 'GRACE'] } },
-            data: { status: 'REVOKED' }
+        console.log('⚠️ SYSTEM RESET INITIATED (Distributed Saga) ...');
+        
+        const restaurant = await prisma.restaurant.findFirst({
+            where: { status: { in: ['ACTIVE', 'GRACE'] } }
         });
 
-        console.log(`[SystemReset] Revoked ${result.count} active restaurants.`);
+        if (restaurant) {
+            await EntityDeletionManager.initiateDeletionSaga(
+                restaurant.id, 
+                'LOCAL_SYSTEM_RESET', 
+                'Local System Reset'
+            );
+        }
 
-        // 3. Clear sessions
-        await prisma.session.deleteMany({});
-
-        console.log(' SYSTEM UNLINK COMPLETE.');
-        res.json({ success: true, message: `Unlinked ${result.count} licenses.` });
+        res.status(202).json({ success: true, message: `System reset saga initiated.` });
 
     } catch (error: any) {
-        console.error('System Unlink Failed:', error);
-        res.status(500).json({ error: 'Unlink Failed', details: error.message });
+        console.error('System Reset Failed:', error);
+        res.status(500).json({ error: 'Reset Failed', details: error.message });
     }
 });
 // --- Module: Secure Revocation (Admin PIN Required) ---
@@ -1570,42 +1628,24 @@ app.post('/api/security/revoke-activation', authenticate, authorize(['ADMIN']), 
 
         registerSuccess(userIdentifier);
 
-        // 3. Perform Revocation
-        console.log(`⚠️ REVOKING ACTIVATION for mechanism: ${restaurantId}`);
+        // 3. Perform Revocation via Distributed Saga
+        console.log(`⚠️ REVOKING ACTIVATION via Saga: ${restaurantId}`);
 
-        // Set status to REVOKED, clear pins (optional but safer), record revocation info
-        // Set status to REVOKED for ALL active restaurants to ensure clean slate
-        // This fixes the issue where old active records cause "Create Master Key" screen
-        await prisma.restaurant.updateMany({
-            where: { status: { in: ['ACTIVE', 'GRACE'] } },
-            data: {
-                status: 'REVOKED',
-                revokedAt: new Date(),
-                revokedBy: deviceId || 'admin',
-                revocationReason: 'User initiated local revocation'
-            }
-        });
+        await EntityDeletionManager.initiateDeletionSaga(
+            restaurantId, 
+            deviceId || 'admin', 
+            'User initiated local revocation'
+        );
 
-        // 4. Clear Sessions
+        // Optional: clear sessions immediately to force logout while saga runs
         await prisma.session.deleteMany({
             where: { restaurantId }
         });
 
-        // 5. Audit Log
-        await prisma.auditLog.create({
-            data: {
-                action: 'SYSTEM_REVOKED',
-                user: deviceId || 'admin',
-                target: 'system',
-                details: JSON.stringify({ success: true, timestamp: new Date() })
-            }
-        });
-
-        console.log(' REVOCATION COMPLETE.');
-        res.json({ success: true, message: 'Device activation revoked successfully' });
+        res.status(202).json({ success: true, message: 'Revocation saga initiated' });
 
     } catch (error) {
-        console.error('Revoke Activation Error:', error);
+        console.error('Secure Revoke Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
     }
 });
@@ -1679,7 +1719,7 @@ app.post('/api/customer/orders', validateTableSession, async (req, res) => {
         const newOrder = await prisma.$transaction(async (tx: any) => {
             const menuItems = await tx.menuItem.findMany({
                 where: { id: { in: orderItems.map((i: any) => i.id || i.menuItemId) } },
-                include: { Category: true }
+                include: { Category: true, variants: true }
             });
 
             // Basic item total before tax
@@ -1691,13 +1731,53 @@ app.post('/api/customer/orders', validateTableSession, async (req, res) => {
                 if (!dbItem) {
                     throw new Error(`Item ${item.id || item.menuItemId} is not currently active or available`);
                 }
-                const price = dbItem.price;
-                calculatedTotal += price * item.quantity;
+                
+                if (!dbItem.isActive) {
+                    throw new Error(`Item ${dbItem.name} is currently inactive`);
+                }
+
+                let finalPrice = dbItem.price;
+                let variantId = null;
+                let variantName = null;
+                let variantPrice = null;
+                let variantSnapshot = null;
+
+                if (dbItem.isVariantEnabled) {
+                    if (!item.variantId) {
+                        throw new Error(`Serving option must be selected for ${dbItem.name}`);
+                    }
+                    const variant = dbItem.variants.find((v: any) => v.id === item.variantId);
+                    if (!variant) {
+                        throw new Error(`Invalid serving option selected for ${dbItem.name}`);
+                    }
+                    if (!variant.isAvailable) {
+                        throw new Error(`${variant.displayName || variant.name} is currently unavailable${variant.unavailableReason ? ` (${variant.unavailableReason})` : ''}`);
+                    }
+                    finalPrice = variant.price;
+                    variantId = variant.id;
+                    variantName = variant.name;
+                    variantPrice = variant.price;
+                    variantSnapshot = JSON.stringify({
+                        id: variant.id,
+                        name: variant.name,
+                        displayName: variant.displayName,
+                        price: variant.price,
+                        unitLabel: variant.unitLabel
+                    });
+                } else if (item.variantId) {
+                    throw new Error(`Item ${dbItem.name} does not support serving options`);
+                }
+
+                calculatedTotal += finalPrice * item.quantity;
                 validOrderItems.push({
                     id: randomUUID(),
                     menuItemId: dbItem.id,
                     quantity: item.quantity,
-                    notes: item.notes
+                    notes: item.notes,
+                    variantId,
+                    variantName,
+                    variantPrice,
+                    variantSnapshot
                 });
 
                 return {
@@ -3322,7 +3402,12 @@ app.get('/api/menu', async (req, res) => {
             include: {
                 MenuItem: {
                     where: { isActive: true },
-                    orderBy: { createdAt: 'asc' }
+                    orderBy: { createdAt: 'asc' },
+                    include: {
+                        variants: {
+                            orderBy: { displayOrder: 'asc' }
+                        }
+                    }
                 }
             },
             orderBy: { createdAt: 'asc' }
@@ -3344,7 +3429,12 @@ app.get('/api/admin/menu', authenticate, authorize(['ADMIN', 'KITCHEN']), async 
             include: {
                 MenuItem: {
                     // Show ALL items, even inactive ones so they can be managed/toggled back on
-                    orderBy: { createdAt: 'asc' }
+                    orderBy: { createdAt: 'asc' },
+                    include: {
+                        variants: {
+                            orderBy: { displayOrder: 'asc' }
+                        }
+                    }
                 }
             }
         });
@@ -3461,7 +3551,7 @@ app.post('/api/categories', authenticate, authorize(['ADMIN']), async (req, res)
 
 // Create Menu Item
 app.post('/api/menu-items', authenticate, authorize(['ADMIN', 'KITCHEN']), async (req, res) => {
-    const { name, description, price, categoryId, image, isActive, foodType, taxSource, gstRate } = req.body;
+    const { name, description, price, categoryId, image, isActive, foodType, taxSource, gstRate, isVariantEnabled, variants } = req.body;
     const { restaurantId } = (req as any).user;
 
     if (!name || !categoryId) {
@@ -3478,13 +3568,34 @@ app.post('/api/menu-items', authenticate, authorize(['ADMIN', 'KITCHEN']), async
                 categoryId,
                 image,
                 isActive: isActive !== false,
+                isVariantEnabled: Boolean(isVariantEnabled),
                 foodType: foodType || 'Veg',
                 taxSource: taxSource || 'RESTAURANT',
                 gstRate: gstRate || null,
-                restaurantId
+                restaurantId,
+                ...(isVariantEnabled && Array.isArray(variants) && variants.length > 0 ? {
+                    variants: {
+                        create: variants.map((v: any, index: number) => ({
+                            id: randomUUID(),
+                            name: v.name,
+                            displayName: v.displayName || null,
+                            price: parseFloat(v.price) || 0,
+                            displayOrder: v.displayOrder !== undefined ? v.displayOrder : index,
+                            isDefault: Boolean(v.isDefault),
+                            isAvailable: v.isAvailable !== false,
+                            unavailableReason: v.unavailableReason || null,
+                            unitLabel: v.unitLabel || null
+                        }))
+                    }
+                } : {})
+            },
+            include: {
+                variants: {
+                    orderBy: { displayOrder: 'asc' }
+                }
             }
         });
-        res.json({ success: true, item });
+        res.json({ success: true, item: normalize(item) });
     } catch (error) {
         console.error('Create Menu Item Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
@@ -3493,7 +3604,7 @@ app.post('/api/menu-items', authenticate, authorize(['ADMIN', 'KITCHEN']), async
 
 app.put('/api/menu-items/:id', authenticate, authorize(['ADMIN', 'KITCHEN']), async (req, res) => {
     const { id } = req.params;
-    const { name, description, price, categoryId, image, isActive, foodType, taxSource, gstRate } = req.body;
+    const { name, description, price, categoryId, image, isActive, foodType, taxSource, gstRate, isVariantEnabled, variants } = req.body;
 
     try {
         const data: any = {};
@@ -3505,6 +3616,7 @@ app.put('/api/menu-items/:id', authenticate, authorize(['ADMIN', 'KITCHEN']), as
         if (foodType !== undefined) data.foodType = foodType;
         if (taxSource !== undefined) data.taxSource = taxSource;
         if (gstRate !== undefined) data.gstRate = gstRate;
+        if (isVariantEnabled !== undefined) data.isVariantEnabled = Boolean(isVariantEnabled);
         if (isActive !== undefined) {
             if (typeof isActive === 'boolean') {
                 data.isActive = isActive;
@@ -3513,11 +3625,92 @@ app.put('/api/menu-items/:id', authenticate, authorize(['ADMIN', 'KITCHEN']), as
             }
         }
 
-        const item = await prisma.menuItem.update({
-            where: { id },
-            data
-        });
-        res.json({ success: true, item });
+        let updatedItem;
+
+        if (isVariantEnabled !== undefined && variants) {
+            // Transaction for stable variant updates
+            updatedItem = await prisma.$transaction(async (tx) => {
+                // 1. Update MenuItem base
+                const item = await tx.menuItem.update({
+                    where: { id },
+                    data
+                });
+
+                // 2. Fetch existing variants
+                const existingVariants = await tx.menuItemVariant.findMany({
+                    where: { menuItemId: id }
+                });
+
+                const existingIds = existingVariants.map(v => v.id);
+                const inputVariants = Array.isArray(variants) ? variants : [];
+                const inputIds = inputVariants.map(v => v.id).filter(Boolean);
+
+                // 3. Delete or soft-delete variants not in input list
+                const variantsToRemove = existingIds.filter(vId => !inputIds.includes(vId));
+                for (const vId of variantsToRemove) {
+                    const usageCount = await tx.orderItem.count({
+                        where: { variantId: vId }
+                    });
+                    if (usageCount > 0) {
+                        // Soft delete (hide from customers)
+                        await tx.menuItemVariant.update({
+                            where: { id: vId },
+                            data: { isAvailable: false, unavailableReason: 'Archived' }
+                        });
+                    } else {
+                        // Hard delete (never ordered)
+                        await tx.menuItemVariant.delete({
+                            where: { id: vId }
+                        });
+                    }
+                }
+
+                // 4. Update existing or Create new variants
+                for (let i = 0; i < inputVariants.length; i++) {
+                    const v = inputVariants[i];
+                    const vData = {
+                        name: v.name,
+                        displayName: v.displayName || null,
+                        price: parseFloat(v.price) || 0,
+                        displayOrder: v.displayOrder !== undefined ? v.displayOrder : i,
+                        isDefault: Boolean(v.isDefault),
+                        isAvailable: v.isAvailable !== false,
+                        unavailableReason: v.unavailableReason || null,
+                        unitLabel: v.unitLabel || null
+                    };
+
+                    if (v.id && existingIds.includes(v.id)) {
+                        // Update
+                        await tx.menuItemVariant.update({
+                            where: { id: v.id },
+                            data: vData
+                        });
+                    } else {
+                        // Create
+                        await tx.menuItemVariant.create({
+                            data: {
+                                id: randomUUID(),
+                                menuItemId: id,
+                                ...vData
+                            }
+                        });
+                    }
+                }
+
+                return await tx.menuItem.findUnique({
+                    where: { id },
+                    include: { variants: { orderBy: { displayOrder: 'asc' } } }
+                });
+            });
+        } else {
+            updatedItem = await prisma.menuItem.update({
+                where: { id },
+                data,
+                include: { variants: { orderBy: { displayOrder: 'asc' } } }
+            });
+        }
+
+        res.json({ success: true, item: normalize(updatedItem) });
     } catch (error) {
         console.error('Update Menu Item Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
@@ -3768,7 +3961,12 @@ app.get('/api/customer/table/:tableId/menu', async (req, res) => {
             include: {
                 MenuItem: {
                     where: { isActive: true },
-                    orderBy: { createdAt: 'asc' }
+                    orderBy: { createdAt: 'asc' },
+                    include: {
+                        variants: {
+                            orderBy: { displayOrder: 'asc' }
+                        }
+                    }
                 }
             },
             orderBy: { createdAt: 'asc' }
@@ -3800,7 +3998,14 @@ app.get('/api/customer/menu/:restaurantId', async (req, res) => {
         const categories = await prisma.category.findMany({
             where: { restaurantId, isActive: true },
             include: {
-                MenuItem: { where: { isActive: true } }
+                MenuItem: { 
+                    where: { isActive: true },
+                    include: {
+                        variants: {
+                            orderBy: { displayOrder: 'asc' }
+                        }
+                    }
+                }
             }
         });
 
@@ -3846,14 +4051,56 @@ app.post('/api/customer/orders', authenticate, authorize(['CUSTOMER']), async (r
 
             for (const item of items) {
                 const menuItem = await tx.menuItem.findUnique({
-                    where: { id: item.menuItemId }
+                    where: { id: item.menuItemId },
+                    include: { variants: true }
                 });
                 if (menuItem) {
-                    calculatedTotal += menuItem.price * item.quantity;
+                    if (!menuItem.isActive) {
+                        throw new Error(`Item ${menuItem.name} is currently inactive`);
+                    }
+
+                    let finalPrice = menuItem.price;
+                    let variantId = null;
+                    let variantName = null;
+                    let variantPrice = null;
+                    let variantSnapshot = null;
+
+                    if (menuItem.isVariantEnabled) {
+                        if (!item.variantId) {
+                            throw new Error(`Serving option must be selected for ${menuItem.name}`);
+                        }
+                        const variant = menuItem.variants.find((v: any) => v.id === item.variantId);
+                        if (!variant) {
+                            throw new Error(`Invalid serving option selected for ${menuItem.name}`);
+                        }
+                        if (!variant.isAvailable) {
+                            throw new Error(`${variant.displayName || variant.name} is currently unavailable${variant.unavailableReason ? ` (${variant.unavailableReason})` : ''}`);
+                        }
+                        finalPrice = variant.price;
+                        variantId = variant.id;
+                        variantName = variant.name;
+                        variantPrice = variant.price;
+                        variantSnapshot = JSON.stringify({
+                            id: variant.id,
+                            name: variant.name,
+                            displayName: variant.displayName,
+                            price: variant.price,
+                            unitLabel: variant.unitLabel
+                        });
+                    } else if (item.variantId) {
+                        throw new Error(`Item ${menuItem.name} does not support serving options`);
+                    }
+
+                    calculatedTotal += finalPrice * item.quantity;
                     validItems.push({
                         id: randomUUID(),
                         menuItemId: item.menuItemId,
-                        quantity: item.quantity
+                        quantity: item.quantity,
+                        notes: item.notes,
+                        variantId,
+                        variantName,
+                        variantPrice,
+                        variantSnapshot
                     });
                 } else {
                     throw new Error(`Item ${item.menuItemId} is not currently active or available`);

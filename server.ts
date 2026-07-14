@@ -681,46 +681,23 @@ app.post('/api/activate', activationLimiter, validate({ body: activateSchema }),
                 });
             }
 
-            // First-time activation: Check if restaurant with this Name already exists (e.g. re-activation/re-linking)
             const restaurantName = codeRecord.entityName || codeRecord.restaurantName;
-            const existingRestaurant = await prisma.restaurant.findFirst({
-                where: { name: restaurantName }
+            // Truly new restaurant (Immutable Identity: Never attempt to relink by mutable name)
+            console.log(`[SaaS Activation] Creating NEW restaurant: ${restaurantName}`);
+            restaurant = await prisma.restaurant.create({
+                data: {
+                    name: restaurantName,
+                    status: 'ACTIVE',
+                    isActive: true,
+                    subscriptionEndsAt: codeRecord.expiresAt,
+                    activationCodeId: codeRecord.id,
+                    activationDate: new Date(),
+                    trialEndDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+                    currentPlan: 'TRIAL',
+                    planStatus: 'TRIAL',
+                    lastCloudVerification: new Date()
+                }
             });
-
-            if (existingRestaurant) {
-                console.log(`[SaaS Activation] Found existing restaurant by name: ${existingRestaurant.name}. Re-linking...`);
-                restaurant = await prisma.restaurant.update({
-                    where: { id: existingRestaurant.id },
-                    data: {
-                        status: 'ACTIVE',
-                        isActive: true,
-                        subscriptionEndsAt: codeRecord.expiresAt,
-                        activationCodeId: codeRecord.id,
-                        activationDate: new Date(),
-                        trialEndDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-                        currentPlan: 'TRIAL',
-                        planStatus: 'TRIAL',
-                        lastCloudVerification: new Date()
-                    }
-                });
-            } else {
-                // Truly new restaurant
-                console.log(`[SaaS Activation] Creating NEW restaurant: ${restaurantName}`);
-                restaurant = await prisma.restaurant.create({
-                    data: {
-                        name: restaurantName,
-                        status: 'ACTIVE',
-                        isActive: true,
-                        subscriptionEndsAt: codeRecord.expiresAt,
-                        activationCodeId: codeRecord.id,
-                        activationDate: new Date(),
-                        trialEndDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-                        currentPlan: 'TRIAL',
-                        planStatus: 'TRIAL',
-                        lastCloudVerification: new Date()
-                    }
-                });
-            }
 
             console.log(`[SaaS Activation] Activated restaurant: ${restaurant.id} (${restaurant.name})`);
         } else {
@@ -3194,6 +3171,37 @@ app.get('/api/device/status', async (req, res) => {
     } catch (error) {
         console.error('System Status Check Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// --- Entity Deletion Saga (Cloud Entry Point) ---
+import { EntityDeletionManager } from './saga/EntityDeletionManager';
+
+app.delete('/api/admin/restaurants/:id', authenticate, authorize(['SUPER_ADMIN']), async (req, res) => {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const initiatedBy = (req as any).user?.id || 'SUPER_ADMIN';
+
+    try {
+        const restaurant = await prisma.restaurant.findUnique({ where: { id } });
+        if (!restaurant) {
+            return res.status(404).json({ error: 'Restaurant not found' });
+        }
+        
+        if (restaurant.status === 'DELETED') {
+            return res.json({ success: true, message: 'Restaurant already deleted' });
+        }
+
+        // Trigger the Saga Orchestrator for the Cloud
+        // In a true hybrid setup, Cloud and Desktop share the same orchestrator logic 
+        // with different Delete Policies.
+        await EntityDeletionManager.initiateDeletionSaga(id, initiatedBy, reason || 'Cloud Admin Deletion', id);
+        
+        // Return 202 Accepted as the Saga is asynchronous
+        res.status(202).json({ success: true, message: 'Entity deletion saga initiated.' });
+    } catch (error) {
+        console.error('Failed to initiate deletion saga:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
