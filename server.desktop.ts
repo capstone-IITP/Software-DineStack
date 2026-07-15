@@ -567,9 +567,8 @@ app.get('/api/kitchen/bootstrap', async (req, res) => {
 app.get('/api/system/status', async (req, res) => {
     try {
         const restaurant = await prisma.restaurant.findFirst({
-            where: { status: { in: ['ACTIVE', 'GRACE', 'SUSPENDED'] } },
             orderBy: { createdAt: 'desc' },
-            include: { ActivationCode: true }
+            include: { ActivationCode: true, activationCodes: true }
         });
 
         if (!restaurant) {
@@ -651,7 +650,7 @@ app.get('/api/system/status', async (req, res) => {
                     planStatus = data.planStatus || 'TRIAL_EXPIRED';
                     await prisma.restaurant.update({
                         where: { id: restaurant.id },
-                        data: { status, planStatus }
+                        data: { status, planStatus, lifecycleRevision: { increment: 1 } }
                     });
                     console.warn(`[License System] Cloud license is not active: ${status}. Lockout applied.`);
                 }

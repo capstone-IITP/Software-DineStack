@@ -1,0 +1,27 @@
+export const ACTIVE_ENTITY_STATES = [
+  "ACTIVATED",
+  "RUNNING"
+];
+
+export const TERMINAL_ENTITY_STATES = [
+  "DELETED",
+  "PURGED"
+];
+
+export const RESTORABLE_ENTITY_STATES = [
+  "DELETED"
+];
+
+export const DELETED_ENTITY_STATES = [
+  "DELETED",
+  "PURGED"
+];
+
+export const NON_ACTIVE_ENTITY_STATES = [
+  "PROVISIONED",
+  "LICENSE_ASSIGNED",
+  "SUSPENDED",
+  "REVOKED",
+  "DELETED",
+  "PURGED"
+];

@@ -187,6 +187,9 @@ model Restaurant {
   email              String?
   phone              String?
   recoveryLockUntil  DateTime?
+  entityVersion      Int              @default(1)
+  lifecycleRevision  Int              @default(1)
+  deletedAt          DateTime?
   activationDate        DateTime?
   trialEndDate          DateTime?
   currentPlan           String?          @default("TRIAL")
