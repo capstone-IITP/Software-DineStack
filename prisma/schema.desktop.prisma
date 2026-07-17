@@ -223,6 +223,8 @@ model Restaurant {
   customers          Customer[]
   refreshTokens      RefreshToken[]
   coupons            Coupon[]
+
+  @@index([name, status])
 }
 
 model Customer {

@@ -5,9 +5,23 @@ export class EntityPersistenceService implements IEntityPersistenceService {
 
   public async applyDeletionTransition(mutatedEntity: any): Promise<any> {
     return await this.transactionManager.execute(async (tx: any) => {
+      await tx.activationCode?.updateMany({
+        where: { OR: [{ restaurantId: mutatedEntity.id }, { id: mutatedEntity.activationCodeId || "" }] },
+        data: {
+          status: "INVALIDATED",
+          isUsed: true,
+          restaurantId: null
+        }
+      });
+
       await tx.session.deleteMany({ where: { restaurantId: mutatedEntity.id } });
       await tx.tableSession.deleteMany({ where: { restaurantId: mutatedEntity.id } });
       await tx.refreshToken.deleteMany({ where: { restaurantId: mutatedEntity.id } });
+      await tx.pairCode?.deleteMany({ where: { restaurantId: mutatedEntity.id } });
+      await tx.recoveryCode?.deleteMany({ where: { restaurantId: mutatedEntity.id } });
+      await tx.apiKey?.deleteMany({ where: { restaurantId: mutatedEntity.id } });
+      await tx.subscription?.deleteMany({ where: { restaurantId: mutatedEntity.id } });
+      await tx.payment?.deleteMany({ where: { restaurantId: mutatedEntity.id } });
       
       const orders = await tx.order.findMany({ where: { restaurantId: mutatedEntity.id }, select: { id: true } });
       const orderIds = orders.map((o: any) => o.id);
@@ -23,6 +37,17 @@ export class EntityPersistenceService implements IEntityPersistenceService {
       await tx.table.deleteMany({ where: { restaurantId: mutatedEntity.id } });
       await tx.customer.deleteMany({ where: { restaurantId: mutatedEntity.id } });
       await tx.coupon.deleteMany({ where: { restaurantId: mutatedEntity.id } });
+      await tx.auditLog?.create({
+        data: {
+          action: "ENTITY_DELETED",
+          target: mutatedEntity.id,
+          details: JSON.stringify(mutatedEntity.deletionAuditMetadata || {
+            archivedDisplayName: mutatedEntity.name,
+            deletedEntityId: mutatedEntity.id
+          }),
+          severity: "INFO"
+        }
+      });
 
       const updated = await tx.restaurant.update({
         where: { id: mutatedEntity.id },
@@ -30,6 +55,7 @@ export class EntityPersistenceService implements IEntityPersistenceService {
           name: mutatedEntity.name,
           status: mutatedEntity.status,
           isActive: mutatedEntity.isActive,
+          activationCodeId: null,
           deletedAt: mutatedEntity.deletedAt,
           lifecycleRevision: mutatedEntity.lifecycleRevision,
           entityVersion: mutatedEntity.entityVersion

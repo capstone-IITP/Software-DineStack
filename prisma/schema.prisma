@@ -96,7 +96,7 @@ model AuditLog {
 
 model Restaurant {
   id                 String           @id @default(uuid())
-  name               String           @unique
+  name               String
   ownerEmail         String?
   status             RestaurantStatus @default(ACTIVE)
   isActive           Boolean?         @default(true)
@@ -157,6 +157,8 @@ model Restaurant {
   tables             Table[]
   tableSessions      TableSession[]
   coupons            Coupon[]
+
+  @@index([name, status])
 }
 
 enum RestaurantStatus {
@@ -165,6 +167,7 @@ enum RestaurantStatus {
   ACTIVATED
   RUNNING
   ACTIVE // Legacy, keeping to prevent immediate errors
+  GRACE
   SUSPENDED
   REVOKED
   DELETED

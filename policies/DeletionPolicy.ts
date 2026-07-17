@@ -7,13 +7,17 @@ export class DeletionPolicy implements IPolicy<any> {
     return PolicyResult.allowed({ strategy });
   }
 
-  public static generateDeletionIdentity(entityName: string, entityId: string): string {
+  public static generateDeletionMarker(entityId: string): string {
     const timestamp = Date.now();
     const shortId = entityId.substring(0, 6);
-    return `${entityName} [DELETED-${timestamp}-${shortId}]`;
+    return `DELETED-${timestamp}-${shortId}`;
   }
 
-  public static shouldReleaseNamespace(entityStatus: string): boolean {
-    return true;
+  public static buildDeletionAuditMetadata(entity: any): any {
+    return {
+      archivedDisplayName: entity.name,
+      deletionMarker: this.generateDeletionMarker(entity.id),
+      deletedEntityId: entity.id
+    };
   }
 }

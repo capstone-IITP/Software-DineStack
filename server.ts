@@ -22,12 +22,32 @@ import {
 } from './middleware/schemas';
 import recoveryRoutes from './routes/recovery.routes';
 import couponRoutes from './routes/coupon.routes';
+import { EntityPolicy } from './policies/EntityPolicy';
 
 const app = express();
 // Prisma instance imported from utils/prisma.ts
 const PORT = process.env.PORT || 5001;
 if (!process.env.PORT) {
     console.log('PORT not specified, defaulting to 5001');
+}
+
+async function findReservedRestaurantByName(client: any, name: string) {
+    const candidates = await client.restaurant.findMany({
+        where: { name },
+        select: { id: true, name: true, status: true, isActive: true },
+        orderBy: { createdAt: 'desc' }
+    });
+    return candidates.find((restaurant: any) => EntityPolicy.isNameReserved(restaurant)) || null;
+}
+
+async function assertActiveNameAvailable(client: any, name: string) {
+    const existing = await findReservedRestaurantByName(client, name);
+    if (existing) {
+        const error: any = new Error(`An active restaurant already exists with the name "${name}".`);
+        error.code = 'ACTIVE_NAME_RESERVED';
+        error.restaurant = existing;
+        throw error;
+    }
 }
 
 // Log Active DB (Masked)
@@ -682,6 +702,8 @@ app.post('/api/activate', activationLimiter, validate({ body: activateSchema }),
             }
 
             const restaurantName = codeRecord.entityName || codeRecord.restaurantName;
+            await assertActiveNameAvailable(prisma, restaurantName);
+
             // Truly new restaurant (Immutable Identity: Never attempt to relink by mutable name)
             console.log(`[SaaS Activation] Creating NEW restaurant: ${restaurantName}`);
             restaurant = await prisma.restaurant.create({
@@ -753,6 +775,9 @@ app.post('/api/activate', activationLimiter, validate({ body: activateSchema }),
 
     } catch (error: any) {
         console.error('[SaaS Activation] Error in cloud activation controller:', error);
+        if (error?.code === 'ACTIVE_NAME_RESERVED') {
+            return res.status(409).json({ error: error.code, details: error.message });
+        }
         // Return detailed error for debugging
         const errorMessage = error?.message || 'Unknown error';
         const errorCode = error?.code || 'UNKNOWN';
@@ -1746,6 +1771,8 @@ app.post('/api/admin/licenses', authenticate, authorize(['ADMIN']), validate({ b
     }
 
     try {
+        await assertActiveNameAvailable(prisma, entityName);
+
         // Generate unique code
         let code = generateActivationCode();
 
@@ -1808,8 +1835,11 @@ app.post('/api/admin/licenses', authenticate, authorize(['ADMIN']), validate({ b
             }
         });
 
-    } catch (error) {
+    } catch (error: any) {
         console.error('Create License Error:', error);
+        if (error?.code === 'ACTIVE_NAME_RESERVED') {
+            return res.status(409).json({ error: error.code, details: error.message });
+        }
         res.status(500).json({ error: 'Failed to create license' });
     }
 });
@@ -1947,10 +1977,13 @@ app.post('/api/admin/activation-codes/:id/link-restaurant', authenticate, author
             });
         }
 
+        const restaurantName = entityName || existingCode.entityName || 'New Restaurant';
+        await assertActiveNameAvailable(prisma, restaurantName);
+
         // Create restaurant and link
         const restaurant = await prisma.restaurant.create({
             data: {
-                name: entityName || existingCode.entityName || 'New Restaurant',
+                name: restaurantName,
                 status: 'ACTIVE',
                 isActive: true,
                 activationCodeId: existingCode.id
@@ -1978,8 +2011,11 @@ app.post('/api/admin/activation-codes/:id/link-restaurant', authenticate, author
             }
         });
 
-    } catch (error) {
+    } catch (error: any) {
         console.error('Link Restaurant Error:', error);
+        if (error?.code === 'ACTIVE_NAME_RESERVED') {
+            return res.status(409).json({ error: error.code, details: error.message });
+        }
         res.status(500).json({ error: 'Failed to link restaurant' });
     }
 });

@@ -1,9 +1,11 @@
 export class EntityPolicy {
-    static ACTIVE_STATES = ['PROVISIONED', 'LICENSE_ASSIGNED', 'ACTIVATED', 'RUNNING', 'SUSPENDED', 'REVOKED'];
+    static ACTIVE_STATES = ['PROVISIONED', 'LICENSE_ASSIGNED', 'ACTIVATED', 'RUNNING', 'ACTIVE', 'GRACE', 'SUSPENDED', 'REVOKED'];
     static TERMINAL_STATES = ['DELETED', 'PURGED'];
 
-    public static isNameReserved(entityStatus: string): boolean {
+    public static isNameReserved(entityOrStatus: any): boolean {
+        const entityStatus = typeof entityOrStatus === 'string' ? entityOrStatus : entityOrStatus?.status;
         if (!entityStatus) return false;
+        if (this.TERMINAL_STATES.includes(entityStatus)) return false;
         return this.ACTIVE_STATES.includes(entityStatus);
     }
     

@@ -1,5 +1,6 @@
 import { IEntityRepository } from "../core/interfaces";
 import { TransactionManager } from "../database/TransactionManager";
+import { EntityPolicy } from "../policies/EntityPolicy";
 
 export class PrismaEntityRepository implements IEntityRepository {
   constructor(private transactionManager: TransactionManager) {}
@@ -17,8 +18,11 @@ export class PrismaEntityRepository implements IEntityRepository {
 
   public async findByName(name: string): Promise<any> {
     const prisma = this.transactionManager.getClient();
-    return await prisma.restaurant.findUnique({
-      where: { name },
+    return await prisma.restaurant.findFirst({
+      where: {
+        name,
+        status: { in: EntityPolicy.ACTIVE_STATES }
+      },
       include: {
         activationCode: true
       }

@@ -51,6 +51,7 @@ import { startSyncService, stopSyncService } from './utils/sync-service';
 import fetch from 'node-fetch';
 import { PrismaClient as CloudPrismaClient } from '@prisma/client';
 import couponRoutes from './routes/coupon.routes';
+import { EntityPolicy } from './policies/EntityPolicy';
 
 // Cloud Prisma client for direct PostgreSQL access (activation, license verification)
 // This bypasses the deployed cloud API which may be outdated
@@ -1371,10 +1372,16 @@ app.post('/api/activate', async (req, res) => {
         // LOCAL SQLite PROVISIONING
         console.log('[SaaS Activation] Provisioning local SQLite database...');
 
-        // Find the most recent local restaurant BEFORE revoking to preserve its PINs (regardless of lockout status)
-        const currentlyActive = await prisma.restaurant.findFirst({
-            orderBy: { createdAt: 'desc' }
+        const terminalLocalRestaurant = await prisma.restaurant.findUnique({
+            where: { id: cloudRestaurantId },
+            select: { id: true, status: true, deletedAt: true }
         });
+        if (terminalLocalRestaurant && EntityPolicy.TERMINAL_STATES.includes(terminalLocalRestaurant.status)) {
+            return res.status(409).json({
+                error: 'TERMINAL_ENTITY_ID',
+                details: 'Deleted restaurant identities are terminal and cannot be reactivated.'
+            });
+        }
 
         // Revoke any existing local active restaurants to prevent multi-session ghost records
         const revokeResult = await prisma.restaurant.updateMany({
@@ -1387,8 +1394,6 @@ app.post('/api/activate', async (req, res) => {
             }
         });
         console.log(`[SaaS Activation] Revoked ${revokeResult.count} local restaurant(s).`);
-
-
 
         // 1. Upsert Restaurant locally WITHOUT activationCodeId to avoid foreign key constraints
         let localRestaurant = await prisma.restaurant.upsert({
@@ -1420,35 +1425,6 @@ app.post('/api/activate', async (req, res) => {
                 lastCloudVerification: new Date()
             }
         });
-
-        // If the new restaurant has no adminPin but the previously active one did, copy the PINs over
-        if (!localRestaurant.adminPin && currentlyActive?.adminPin) {
-            console.log(`[SaaS Activation] Copying PINs from previously active restaurant to new restaurant ${localRestaurant.id}`);
-            localRestaurant = await prisma.restaurant.update({
-                where: { id: localRestaurant.id },
-                data: {
-                    adminPin: currentlyActive.adminPin,
-                    kitchenPin: currentlyActive.kitchenPin
-                }
-            });
-        }
-
-        // If cloud generated a new restaurant ID for a new license, migrate local data
-        if (currentlyActive && currentlyActive.id !== cloudRestaurantId) {
-            console.log(`[SaaS Activation] Migrating local data from ${currentlyActive.id} to new cloud ID ${cloudRestaurantId}`);
-            const entities = ['category', 'menuItem', 'table', 'order', 'device', 'session', 'tableSession', 'recoveryCode', 'customer', 'refreshToken'];
-            for (const entity of entities) {
-                try {
-                    await (prisma as any)[entity].updateMany({
-                        where: { restaurantId: currentlyActive.id },
-                        data: { restaurantId: cloudRestaurantId }
-                    });
-                } catch (e) { console.warn(`Migration of ${entity} failed:`, e); }
-            }
-            // Attempt to clean up old restaurant to avoid duplicate confusion
-            try { await prisma.restaurant.delete({ where: { id: currentlyActive.id } }); } catch (e) { }
-        }
-
 
         // 2. Upsert ActivationCode locally
         const localCodeId = randomUUID();
@@ -2423,6 +2399,13 @@ app.post('/api/recovery/execute', async (req, res) => {
 
         if (!cloudRestaurant) {
             return res.status(400).json({ error: 'Restaurant data not found in cloud' });
+        }
+
+        if (EntityPolicy.TERMINAL_STATES.includes(cloudRestaurant.status)) {
+            return res.status(410).json({
+                error: 'ENTITY_DELETED',
+                details: 'Deleted restaurant identities are terminal and cannot be recovered.'
+            });
         }
 
         if (cloudRestaurant.ownerId !== ownerId) {

@@ -56,11 +56,11 @@ async function runDirectSync(
 
     // 0. Sync ActivationCode and Restaurant to satisfy Foreign Keys
     try {
-        const localRest = await prisma.restaurant.findUnique({ 
+        const localRest = await prisma.restaurant.findUnique({
             where: { id: restaurantId },
             include: { ActivationCode: true }
         });
-        
+
         let cloudActivationCodeId: string | null = localRest?.activationCodeId || null;
         const upsertActivationCode = async (withRestaurantId: boolean) => {
             if (!localRest?.ActivationCode) return;
@@ -123,36 +123,10 @@ async function runDirectSync(
                     }
                 });
             } catch (upsertErr: any) {
-                if (upsertErr.code === 'P2002' && upsertErr.meta?.target?.includes('name')) {
-                    const uniqueName = `${localRest.name} (${restaurantId.substring(0, 8)})`;
-                    console.log(`[Sync Service] Restaurant name conflict. Retrying with name: ${uniqueName}`);
-                    await cloudPrisma.restaurant.upsert({
-                        where: { id: restaurantId },
-                        update: {
-                            name: uniqueName,
-                            status: localRest.status,
-                            isActive: localRest.isActive,
-                            adminPin: localRest.adminPin,
-                            kitchenPin: localRest.kitchenPin,
-                            activationCodeId: cloudActivationCodeId
-                        },
-                        create: {
-                            id: localRest.id,
-                            name: uniqueName,
-                            status: localRest.status,
-                            isActive: localRest.isActive,
-                            adminPin: localRest.adminPin,
-                            kitchenPin: localRest.kitchenPin,
-                            activationCodeId: cloudActivationCodeId,
-                            createdAt: localRest.createdAt || new Date()
-                        }
-                    });
-                } else {
-                    console.error(`[Sync Service] Restaurant upsert failed:`, upsertErr);
-                    throw upsertErr;
-                }
+                console.error(`[Sync Service] Restaurant upsert failed without mutating display name:`, upsertErr);
+                throw upsertErr;
             }
-            
+
             try {
                 await upsertActivationCode(true); // Second pass: now link the restaurantId
             } catch (err: any) {
@@ -708,7 +682,7 @@ export async function runSync() {
                                         restaurantId: cloudOrder.restaurantId,
                                         createdAt: cloudOrder.table.createdAt ? new Date(cloudOrder.table.createdAt) : new Date()
                                     }
-                                }).catch(() => {});
+                                }).catch(() => { });
                             }
 
                             // Ensure menu items and categories exist locally
@@ -727,7 +701,7 @@ export async function runSync() {
                                                         isActive: false,
                                                         restaurantId: cloudOrder.restaurantId,
                                                     }
-                                                }).catch(() => {});
+                                                }).catch(() => { });
                                             }
                                         }
 
@@ -745,7 +719,7 @@ export async function runSync() {
                                                 restaurantId: cloudOrder.restaurantId,
                                                 createdAt: item.menuItem.createdAt ? new Date(item.menuItem.createdAt) : new Date()
                                             }
-                                        }).catch(() => {});
+                                        }).catch(() => { });
                                     }
                                 }
                             }
